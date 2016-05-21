@@ -75,10 +75,14 @@ func (*LookupResponse) ProtoMessage()               {}
 func (*LookupResponse) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{3} }
 
 type RequestVoteArgs struct {
-	Term         uint32 `protobuf:"varint,1,opt,name=term" json:"term,omitempty"`
-	CandidateId  uint32 `protobuf:"varint,2,opt,name=candidateId" json:"candidateId,omitempty"`
+	// candidate’s term
+	Term uint32 `protobuf:"varint,1,opt,name=term" json:"term,omitempty"`
+	// candidate requesting vote
+	CandidateId uint32 `protobuf:"varint,2,opt,name=candidateId" json:"candidateId,omitempty"`
+	// index of candidate’s last log entry
 	LastLogIndex uint32 `protobuf:"varint,3,opt,name=lastLogIndex" json:"lastLogIndex,omitempty"`
-	LastLogTerm  uint32 `protobuf:"varint,4,opt,name=lastLogTerm" json:"lastLogTerm,omitempty"`
+	// term of candidate’s last log entry
+	LastLogTerm uint32 `protobuf:"varint,4,opt,name=lastLogTerm" json:"lastLogTerm,omitempty"`
 }
 
 func (m *RequestVoteArgs) Reset()                    { *m = RequestVoteArgs{} }
@@ -87,8 +91,10 @@ func (*RequestVoteArgs) ProtoMessage()               {}
 func (*RequestVoteArgs) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{4} }
 
 type RequestVoteResponse struct {
-	Term        uint32 `protobuf:"varint,1,opt,name=term" json:"term,omitempty"`
-	VoteGranted bool   `protobuf:"varint,2,opt,name=voteGranted" json:"voteGranted,omitempty"`
+	// currentTerm, for candidate to update itself
+	Term uint32 `protobuf:"varint,1,opt,name=term" json:"term,omitempty"`
+	// true means candidate received vote
+	VoteGranted bool `protobuf:"varint,2,opt,name=voteGranted" json:"voteGranted,omitempty"`
 }
 
 func (m *RequestVoteResponse) Reset()                    { *m = RequestVoteResponse{} }
@@ -97,12 +103,18 @@ func (*RequestVoteResponse) ProtoMessage()               {}
 func (*RequestVoteResponse) Descriptor() ([]byte, []int) { return fileDescriptor0, []int{5} }
 
 type AppendEntriesArgs struct {
-	Term         uint32      `protobuf:"varint,1,opt,name=term" json:"term,omitempty"`
-	LeaderId     uint32      `protobuf:"varint,2,opt,name=leaderId" json:"leaderId,omitempty"`
-	PrevLogIndex uint32      `protobuf:"varint,3,opt,name=prevLogIndex" json:"prevLogIndex,omitempty"`
-	PrevLogTerm  uint32      `protobuf:"varint,4,opt,name=prevLogTerm" json:"prevLogTerm,omitempty"`
-	Entries      []*LogEntry `protobuf:"bytes,5,rep,name=entries" json:"entries,omitempty"`
-	LeaderCommit uint32      `protobuf:"varint,6,opt,name=leaderCommit" json:"leaderCommit,omitempty"`
+	// leader’s term
+	Term uint32 `protobuf:"varint,1,opt,name=term" json:"term,omitempty"`
+	// so follower can redirect clients
+	LeaderId uint32 `protobuf:"varint,2,opt,name=leaderId" json:"leaderId,omitempty"`
+	// index of log entry immediately preceding new ones
+	PrevLogIndex uint32 `protobuf:"varint,3,opt,name=prevLogIndex" json:"prevLogIndex,omitempty"`
+	// term of prevLogIndex entry
+	PrevLogTerm uint32 `protobuf:"varint,4,opt,name=prevLogTerm" json:"prevLogTerm,omitempty"`
+	// log entries to store (empty for heartbeat; may send more than one for efficiency)
+	Entries []*LogEntry `protobuf:"bytes,5,rep,name=entries" json:"entries,omitempty"`
+	// leader’s commitIndex
+	LeaderCommit uint32 `protobuf:"varint,6,opt,name=leaderCommit" json:"leaderCommit,omitempty"`
 }
 
 func (m *AppendEntriesArgs) Reset()                    { *m = AppendEntriesArgs{} }
@@ -118,8 +130,10 @@ func (m *AppendEntriesArgs) GetEntries() []*LogEntry {
 }
 
 type AppendEntriesResponse struct {
-	Term    uint32 `protobuf:"varint,1,opt,name=term" json:"term,omitempty"`
-	Success bool   `protobuf:"varint,2,opt,name=success" json:"success,omitempty"`
+	// currentTerm, for leader to update itself
+	Term uint32 `protobuf:"varint,1,opt,name=term" json:"term,omitempty"`
+	// true if follower contained entry matching prevLogIndex and prevLogTerm
+	Success bool `protobuf:"varint,2,opt,name=success" json:"success,omitempty"`
 }
 
 func (m *AppendEntriesResponse) Reset()                    { *m = AppendEntriesResponse{} }
