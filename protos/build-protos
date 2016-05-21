@@ -1,0 +1,3 @@
+#!/bin/sh
+
+protoc -I . raft.proto --go_out=plugins=grpc:.
