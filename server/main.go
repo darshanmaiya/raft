@@ -4,9 +4,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/darshanmaiya/raft/config"
@@ -16,47 +18,84 @@ import (
 	"google.golang.org/grpc/grpclog"
 )
 
-const (
-	FOLLOWER  = iota // FOLLOWER == 0
-	CANDIDATE = iota // CANDIDATE == 1
-	LEADER    = iota // LEADER == 2
+type NodeState uint8
 
-	ELECTION_TIMEOUT = 150 // in ms
+const (
+	Follower NodeState = iota << 1
+	Candidate
+	Leader
 )
 
 // Raft represents an instance of raft implementing the gRPC
 // server interface.
 type Raft struct {
 	// Persistent state on all servers:
+	//
 	// (Updated on stable storage before responding to RPCs)
-	ServerID              uint32
-	Port                  string
-	State                 int
-	LastMessageTimeStamp  int64
-	MajorityVotesReceived bool
+	ServerID uint32
+	Port     string
+	State    NodeState
 
-	CurrentTerm uint32           // latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	VotedFor    uint32           // candidateId that received vote in current term (or null if none)
-	Log         []*raft.LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+	// CurrentTerm is the latest term server has seen (initialized to 0 on
+	// first boot, increases monotonically)
+	CurrentTerm uint32
+
+	// VotedFor is the candidateId that received vote in current term (or
+	// null if none)
+	VotedFor *uint32
+
+	// Log is all log entries. Each entry contains command for state
+	// machine, and term when entry was received by leader (first index is 1)
+	Log []*raft.LogEntry
 
 	// Volatile state on all servers:
-	CommitIndex uint32 // index of highest log entry known to be committed (initialized to 0, increases monotonically)
-	LastApplied uint32 // index of highest log entry applied to state	machine (initialized to 0, increases monotonically)
+	//
+	// CommitIndex is the index of highest log entry known to be committed
+	// (initialized to 0, increases monotonically)
+	CommitIndex uint32
+
+	// LastApplied is the index of highest log entry applied to state machine
+	// (initialized to 0, increases monotonically)
+	LastApplied uint32
 
 	// Volatile state on leaders:
 	// (Reinitialized after election)
-	NextIndex  []uint32 // for each server, index of the next log entry to send to that server (initialized to leader	last log index + 1)
-	MatchIndex []uint32 // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+	//
+	// NextIndex marks for each server, index of the next log entry to send
+	// to that server (initialized to leader	last log index + 1)
+	NextIndex []uint32
 
-	Participants map[int]string // All participating servers in Raft
+	// MatchIndex marks for each server, index of highest log entry known
+	// to be replicated on server (initialized to 0, increases monotonically)
+	MatchIndex []uint32
+
+	// Participants is the set of all participating servers in Raft.
+	Participants map[int]string
+
+	stateTransition chan NodeState
+
+	electionLost chan struct{}
+	msgReceived  chan struct{}
+
+	nodes map[uint32]raft.RaftClient
+
+	wg   sync.WaitGroup
+	quit chan struct{}
 }
 
 // newRaft creates a new instance of raft given its server id.
 func newRaft(serverID uint32) (*Raft, error) {
 	s := &Raft{
 		ServerID:     serverID,
-		State:        FOLLOWER,
+		State:        Follower,
 		Participants: make(map[int]string),
+
+		stateTransition: make(chan NodeState, 1),
+
+		electionLost: make(chan struct{}, 1),
+		msgReceived:  make(chan struct{}, 1),
+
+		quit: make(chan struct{}, 1),
 	}
 
 	// Get the map of participants from the global config.
@@ -68,6 +107,25 @@ func newRaft(serverID uint32) (*Raft, error) {
 
 	// Set the port for this server
 	s.Port = strings.Split(s.Participants[int(serverID)], ":")[1]
+
+	for i, server := range s.Participants {
+		if i == int(s.ServerID) {
+			continue
+		}
+
+		var opts []grpc.DialOption
+		// TODO(roasbeef): add goroutine to poll state of all
+		// connections and reconnect (will need mutex).
+		opts = append(opts, grpc.WithInsecure())
+		opts = append(opts, grpc.WithTimeout(time.Minute*5))
+		conn, err := grpc.Dial(server, opts...)
+		if err != nil {
+			return nil, err
+		}
+
+		client := raft.NewRaftClient(conn)
+		s.nodes[uint32(i)] = client
+	}
 
 	fmt.Println("Participant servers initialized successfully.")
 	s.printParticipants()
@@ -85,16 +143,31 @@ func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupRe
 
 func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raft.RequestVoteResponse, error) {
 
+	var granted bool
+
+	if req.Term < s.CurrentTerm || s.VotedFor != nil {
+		granted = false
+	} else {
+		s.VotedFor = &req.CandidateId
+		granted = true
+	}
+
 	fmt.Printf("Server %d is requesting vote..\n", req.CandidateId)
-	s.LastMessageTimeStamp = time.Now().UnixNano()
 	return &raft.RequestVoteResponse{
-		Term:        req.Term,
-		VoteGranted: true,
+		Term:        s.CurrentTerm,
+		VoteGranted: granted,
 	}, nil
 }
 
 func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (*raft.AppendEntriesResponse, error) {
+	// If we get a heart beat with an empty log and we're a candidate, then we
+	// lost the election.
+	if s.State == Candidate && len(req.Entries) == 0 {
+		s.electionLost <- struct{}{}
+	}
 
+	// TODO(all): if received from leader, then set on msgReceived timeout
+	//  * scope: global
 	return &raft.AppendEntriesResponse{}, nil
 }
 
@@ -117,140 +190,111 @@ var (
 	serverID = flag.Int("id", 0, "The server ID")
 )
 
-func (s *Raft) sendRequestRPC() {
+func (r *Raft) coordinator() {
+	serverDownTimeout := 150 * time.Millisecond
+	serverDownTimer := time.NewTimer(serverDownTimeout)
+
+	var electionTimer <-chan time.Time
+	electionCancel := make(chan struct{}, 1)
+
+out:
+	for {
+		select {
+		case <-r.msgReceived:
+			// We got a message from the leader before the timeout was
+			// up. So reset it.
+			serverDownTimer.Reset(serverDownTimeout)
+		case <-serverDownTimer.C:
+			// Haven't received message from leader in serverDownTimeout
+			// period. So start an election after a random period of time.
+			electionBackOff := time.Duration(rand.Intn(140)+10) * time.Millisecond
+			electionTimer = time.After(electionBackOff)
+		case <-electionTimer:
+			r.State = Candidate
+
+			electionTimeout := time.After(serverDownTimeout)
+			go r.startElection(electionCancel, electionTimeout, serverDownTimeout)
+		case <-r.electionLost:
+			r.State = Follower
+
+			// The election was lost, cancel the election timer.
+			// TODO(roasbeef): possible goroutine leak by just
+			// using time.After?
+			electionTimer = nil
+			serverDownTimer.Reset(serverDownTimeout)
+			electionCancel <- struct{}{}
+		case r.State = <-r.stateTransition:
+		case <-r.quit:
+			break out
+		}
+	}
+
+	r.wg.Done()
+}
+
+func (s *Raft) startElection(cancelSignal chan struct{},
+	electionTimeout <-chan time.Time, timeoutDuration time.Duration) {
+
 	fmt.Println("Sending RequestVoteRPC...")
-	majority := len(s.Participants) / 2 // +1 not required as self vote is always assumed
+
+	// +1 not required as self vote is always assumed
+	majority := len(s.Participants) / 2
 	response := make(chan raft.RequestVoteResponse, len(s.Participants))
 	successVotes := 0
 
-	for i, value := range s.Participants {
-		if i != int(s.ServerID) {
-			var opts []grpc.DialOption
-			opts = append(opts, grpc.WithInsecure())
-			conn, err := grpc.Dial(value, opts...)
-			if err != nil {
-				grpclog.Fatalf("Failed to dial: %v", err)
-				break
+	for _, node := range s.nodes {
+		go func(n raft.RaftClient) {
+			term := uint32(0)
+			args := &raft.RequestVoteArgs{
+				Term:         s.CurrentTerm,
+				CandidateId:  s.ServerID,
+				LastLogIndex: uint32(len(s.Log)),
 			}
-			go func() {
-				client := raft.NewRaftClient(conn)
-				args := &raft.RequestVoteArgs{
-					Term:         s.CurrentTerm,
-					CandidateId:  s.ServerID,
-					LastLogIndex: 0,
-					LastLogTerm:  0,
-				}
+			if s.Log != nil {
+				term = s.Log[len(s.Log)-1].Term
+			}
+			args.LastLogTerm = uint32(term)
 
-				reply, err := client.RequestVote(context.Background(), args)
-				if err != nil {
-					log.Fatal("Server error:", err)
-					response <- raft.RequestVoteResponse{
-						VoteGranted: false,
-					}
-				} else {
-					response <- raft.RequestVoteResponse{
-						Term:        reply.Term,
-						VoteGranted: reply.VoteGranted,
-					}
+			reply, err := n.RequestVote(context.Background(), args)
+			if err != nil {
+				log.Fatal("Server error:", err)
+				response <- raft.RequestVoteResponse{
+					VoteGranted: false,
 				}
-
-				defer conn.Close()
-			}()
-		}
+			} else {
+				response <- raft.RequestVoteResponse{
+					Term:        reply.Term,
+					VoteGranted: reply.VoteGranted,
+				}
+			}
+		}(node)
 	}
 
 	for i := 0; i < len(s.Participants); i++ {
-		reply := <-response
-		if reply.VoteGranted {
-			successVotes++
-		}
-
-		if successVotes >= majority {
-			s.MajorityVotesReceived = true
-			break
-		}
-	}
-}
-
-func (s *Raft) sendHeartBeat() {
-	fmt.Println("Sending HeartBeatRPC...")
-	majority := len(s.Participants) / 2 // +1 not required as self vote is always assumed
-	response := make(chan raft.AppendEntryResponse, len(s.Participants))
-	successVotes := 0
-
-	for i, value := range s.Participants {
-		if i != int(s.ServerID) {
-			var opts []grpc.DialOption
-			opts = append(opts, grpc.WithInsecure())
-			conn, err := grpc.Dial(value, opts...)
-			if err != nil {
-				grpclog.Fatalf("Failed to dial: %v", err)
-				break
+		select {
+		case <-cancelSignal:
+			return
+		case <-electionTimeout:
+			go s.startElection(cancelSignal, time.After(timeoutDuration), timeoutDuration)
+			return
+		case <-response:
+			reply := <-response
+			if reply.VoteGranted {
+				successVotes++
 			}
-			go func() {
-				client := raft.NewRaftClient(conn)
-				args := &raft.RequestVoteArgs{
-					Term:         s.CurrentTerm,
-					CandidateId:  s.ServerID,
-					LastLogIndex: 0,
-					LastLogTerm:  0,
-				}
 
-				reply, err := client.RequestVote(context.Background(), args)
-				if err != nil {
-					log.Fatal("Server error:", err)
-					response <- raft.RequestVoteResponse{
-						VoteGranted: false,
-					}
-				} else {
-					response <- raft.RequestVoteResponse{
-						Term:        reply.Term,
-						VoteGranted: reply.VoteGranted,
-					}
-				}
-
-				defer conn.Close()
-			}()
+			if successVotes >= majority {
+				s.stateTransition <- Leader
+				return
+			}
 		}
 	}
-
-	for i := 0; i < len(s.Participants); i++ {
-		reply := <-response
-		if reply.VoteGranted {
-			successVotes++
-		}
-
-		if successVotes >= majority {
-			s.MajorityVotesReceived = true
-			break
-		}
-	}
-}
-
-func (s *Raft) timeout() {
-	if s.State == FOLLOWER && time.Now().UnixNano()-s.LastMessageTimeStamp > ELECTION_TIMEOUT*1000000 { // TODO Remove 100000
-		fmt.Println("No message from leader in the specified timeout. Transitioning to CANDIDATE...")
-		s.State = CANDIDATE
-		s.MajorityVotesReceived = false
-		s.sendRequestRPC()
-	} else if s.State == CANDIDATE {
-		// if enough votes received
-		s.MajorityVotesReceived = true
-		if s.MajorityVotesReceived {
-			fmt.Println("Votes received to become leader. Transitioning to LEADER...")
-			s.State = LEADER
-			fmt.Println("I'm now a leader...")
-		} else {
-			s.State = FOLLOWER
-		}
-	} else if s.State == LEADER {
-		s.sendHeartBeat()
-	}
-	time.Sleep(ELECTION_TIMEOUT / 150 * time.Second) // TODO Remove 150
-	s.timeout()
 }
 
 func main() {
+	// Seed the prng.
+	rand.Seed(time.Now().Unix())
+
 	flag.Parse()
 
 	raftServer, err := newRaft(uint32(*serverID))
@@ -274,12 +318,5 @@ func main() {
 
 	raft.RegisterRaftServer(grpcServer, raftServer)
 
-	go grpcServer.Serve(lis)
-
-	raftServer.LastMessageTimeStamp = time.Now().UnixNano()
-	go raftServer.timeout()
-
-	for {
-
-	}
+	grpcServer.Serve(lis)
 }
