@@ -132,6 +132,13 @@ func newRaft(serverID uint32) (*Raft, error) {
 	return s, nil
 }
 
+func (r *Raft) Start() error {
+	r.wg.Add(1)
+	go r.coordinator()
+
+	return nil
+}
+
 func (s *Raft) Post(ctx context.Context, req *raft.PostArgs) (*raft.PostResponse, error) {
 	return &raft.PostResponse{}, nil
 }
