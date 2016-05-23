@@ -149,9 +149,11 @@ func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupRe
 }
 
 func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raft.RequestVoteResponse, error) {
-
 	var granted bool
 
+	// If we've already voted for a new candidate during this term, then
+	// decline the request, otherwise accept this as a new candidate and
+	// record our vote.
 	if req.Term < s.CurrentTerm || s.VotedFor != nil {
 		granted = false
 	} else {
@@ -173,8 +175,8 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 		s.electionLost <- struct{}{}
 	}
 
-	// TODO(all): if received from leader, then set on msgReceived timeout
-	//  * scope: global
+	s.msgReceived <- struct{}{}
+
 	return &raft.AppendEntriesResponse{}, nil
 }
 
@@ -199,19 +201,23 @@ var (
 
 func (r *Raft) coordinator() {
 	serverDownTimeout := 150 * time.Millisecond
-	serverDownTimer := time.NewTimer(serverDownTimeout)
+	heartBeatTimeout := 100 * time.Millisecond
 
+	// TODO(roasbeef): possible goroutine leak by just
+	// using time.After?
+	var serverDownTimer <-chan time.Time
 	var electionTimer <-chan time.Time
-	electionCancel := make(chan struct{}, 1)
+	var heartBeatTimer <-chan time.Time
 
+	electionCancel := make(chan struct{}, 1)
 out:
 	for {
 		select {
 		case <-r.msgReceived:
 			// We got a message from the leader before the timeout was
 			// up. So reset it.
-			serverDownTimer.Reset(serverDownTimeout)
-		case <-serverDownTimer.C:
+			serverDownTimer = time.After(serverDownTimeout)
+		case <-serverDownTimer:
 			// Haven't received message from leader in serverDownTimeout
 			// period. So start an election after a random period of time.
 			electionBackOff := time.Duration(rand.Intn(140)+10) * time.Millisecond
@@ -225,18 +231,43 @@ out:
 			r.State = Follower
 
 			// The election was lost, cancel the election timer.
-			// TODO(roasbeef): possible goroutine leak by just
-			// using time.After?
 			electionTimer = nil
-			serverDownTimer.Reset(serverDownTimeout)
+			serverDownTimer = time.After(serverDownTimeout)
 			electionCancel <- struct{}{}
 		case r.State = <-r.stateTransition:
+			// Reset all the timers, and trigger the heart beat timer.
+			electionTimer = nil
+
+			go r.sendHeatBeat()
+
+			heartBeatTimer = time.After(heartBeatTimeout)
+		case <-heartBeatTimer:
+			// Send out heart beats to all participants, and reset the
+			// timer.
+			go r.sendHeatBeat()
+
+			heartBeatTimer = time.After(heartBeatTimeout)
 		case <-r.quit:
 			break out
 		}
 	}
 
 	r.wg.Done()
+}
+
+func (s *Raft) sendHeatBeat() {
+	for _, node := range s.nodes {
+		go func(n raft.RaftClient) {
+			args := &raft.AppendEntriesArgs{
+				Term:     s.CurrentTerm,
+				LeaderId: s.CurrentTerm,
+			}
+
+			if _, err := n.AppendEntries(context.Background(), args); err != nil {
+				log.Fatalf("Server during heartbeat error:", err)
+			}
+		}(node)
+	}
 }
 
 func (s *Raft) startElection(cancelSignal chan struct{},
