@@ -63,11 +63,11 @@ type Raft struct {
 	//
 	// NextIndex marks for each server, index of the next log entry to send
 	// to that server (initialized to leader	last log index + 1)
-	NextIndex []uint32
+	NextIndex map[int]uint32
 
 	// MatchIndex marks for each server, index of highest log entry known
 	// to be replicated on server (initialized to 0, increases monotonically)
-	MatchIndex []uint32
+	MatchIndex map[int]uint32
 
 	// Participants is the set of all participating servers in Raft.
 	Participants map[int]string
@@ -90,10 +90,15 @@ func newRaft(serverID uint32) (*Raft, error) {
 		State:        Follower,
 		Participants: make(map[int]string),
 
+		NextIndex:  make(map[int]uint32),
+		MatchIndex: make(map[int]uint32),
+
 		stateTransition: make(chan NodeState, 1),
 
 		electionLost: make(chan struct{}, 1),
 		msgReceived:  make(chan struct{}, 1),
+
+		nodes: make(map[uint32]raft.RaftClient),
 
 		quit: make(chan struct{}, 1),
 	}
