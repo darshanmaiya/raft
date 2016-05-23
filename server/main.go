@@ -177,6 +177,7 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 	// If we get a heart beat with an empty log and we're a candidate, then we
 	// lost the election.
 	if s.State == Candidate && len(req.Entries) == 0 {
+		log.Println("I lost the election")
 		s.electionLost <- struct{}{}
 	}
 
@@ -218,37 +219,48 @@ func (r *Raft) coordinator() {
 out:
 	for {
 		select {
-		case <-r.msgReceived:
-			// We got a message from the leader before the timeout was
-			// up. So reset it.
-			serverDownTimer = time.After(serverDownTimeout)
 		case <-serverDownTimer:
 			// Haven't received message from leader in serverDownTimeout
 			// period. So start an election after a random period of time.
 			electionBackOff := time.Duration(rand.Intn(140)+10) * time.Millisecond
+
+			log.Printf("haven't heard from header, backing off to election: %v\n",
+				electionBackOff)
 			electionTimer = time.After(electionBackOff)
 		case <-electionTimer:
+			log.Println("election back off triggered, requesting votes")
 			r.State = Candidate
 
 			electionTimeout := time.After(serverDownTimeout)
 			go r.startElection(electionCancel, electionTimeout, serverDownTimeout)
+		case <-heartBeatTimer:
+			// Send out heart beats to all participants, and reset the
+			// timer.
+			log.Println("Sending heart beat")
+			go r.sendHeatBeat()
+
+			heartBeatTimer = time.After(heartBeatTimeout)
+		case <-r.msgReceived:
+			log.Println("received heartbeat, leader is still up")
+			// We got a message from the leader before the timeout was
+			// up. So reset it.
+			serverDownTimer = time.After(serverDownTimeout)
 		case <-r.electionLost:
+			log.Println("I lost the election, switching to follower")
 			r.State = Follower
 
 			// The election was lost, cancel the election timer.
 			electionTimer = nil
+			heartBeatTimer = nil
 			serverDownTimer = time.After(serverDownTimeout)
 			electionCancel <- struct{}{}
 		case r.State = <-r.stateTransition:
+			log.Println("I won election, sending heartbeat")
+
 			// Reset all the timers, and trigger the heart beat timer.
 			electionTimer = nil
+			serverDownTimer = nil
 
-			go r.sendHeatBeat()
-
-			heartBeatTimer = time.After(heartBeatTimeout)
-		case <-heartBeatTimer:
-			// Send out heart beats to all participants, and reset the
-			// timer.
 			go r.sendHeatBeat()
 
 			heartBeatTimer = time.After(heartBeatTimeout)
