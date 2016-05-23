@@ -345,6 +345,10 @@ func main() {
 		log.Fatalf("unable to create raft server: %v", err)
 	}
 
+	if err := raftServer.Start(); err != nil {
+		log.Fatalf("unable to start raft server: %v", err)
+	}
+
 	// Grab the port we should listen to.
 	selfPort := raftServer.Port
 	*port, _ = strconv.Atoi(selfPort)
