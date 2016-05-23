@@ -211,11 +211,12 @@ func (r *Raft) coordinator() {
 
 	// TODO(roasbeef): possible goroutine leak by just
 	// using time.After?
-	var serverDownTimer <-chan time.Time
+	serverDownTimer := time.After(serverDownTimeout)
 	var electionTimer <-chan time.Time
 	var heartBeatTimer <-chan time.Time
 
 	electionCancel := make(chan struct{}, 1)
+
 out:
 	for {
 		select {
