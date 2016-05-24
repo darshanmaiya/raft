@@ -159,7 +159,7 @@ func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raf
 	// If we've already voted for a new candidate during this term, then
 	// decline the request, otherwise accept this as a new candidate and
 	// record our vote.
-	if req.Term < s.CurrentTerm || s.VotedFor != nil {
+	if req.Term < s.CurrentTerm || s.VotedFor != nil || s.State == Candidate {
 		granted = false
 	} else {
 		s.VotedFor = &req.CandidateId
@@ -206,8 +206,8 @@ var (
 )
 
 func (r *Raft) coordinator() {
-	serverDownTimeout := 150 * time.Millisecond
-	heartBeatTimeout := 100 * time.Millisecond
+	serverDownTimeout := 1500 * time.Millisecond
+	heartBeatTimeout := 1000 * time.Millisecond
 
 	// TODO(roasbeef): possible goroutine leak by just
 	// using time.After?
@@ -223,7 +223,7 @@ out:
 		case <-serverDownTimer:
 			// Haven't received message from leader in serverDownTimeout
 			// period. So start an election after a random period of time.
-			electionBackOff := time.Duration(rand.Intn(140)+10) * time.Millisecond
+			electionBackOff := time.Duration(rand.Intn(1400)+100) * time.Millisecond
 
 			log.Printf("haven't heard from header, backing off to election: %v\n",
 				electionBackOff)
@@ -233,6 +233,7 @@ out:
 			r.State = Candidate
 
 			electionTimeout := time.After(serverDownTimeout)
+			serverDownTimer = nil
 			go r.startElection(electionCancel, electionTimeout, serverDownTimeout)
 		case <-heartBeatTimer:
 			// Send out heart beats to all participants, and reset the
@@ -294,9 +295,9 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 	fmt.Println("Sending RequestVoteRPC...")
 
 	// +1 not required as self vote is always assumed
-	majority := len(s.Participants) / 2
+	majority := (len(s.Participants) / 2) + 1
 	response := make(chan raft.RequestVoteResponse, len(s.Participants))
-	successVotes := 0
+	successVotes := 1
 
 	for _, node := range s.nodes {
 		go func(n raft.RaftClient) {
@@ -310,8 +311,9 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 				term = s.Log[len(s.Log)-1].Term
 			}
 			args.LastLogTerm = uint32(term)
-
+			fmt.Println("Sending request vote...")
 			reply, err := n.RequestVote(context.Background(), args)
+			fmt.Println("Received request vote...")
 			if err != nil {
 				log.Fatal("Server error:", err)
 				response <- raft.RequestVoteResponse{
@@ -333,8 +335,7 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 		case <-electionTimeout:
 			go s.startElection(cancelSignal, time.After(timeoutDuration), timeoutDuration)
 			return
-		case <-response:
-			reply := <-response
+		case reply := <-response:
 			if reply.VoteGranted {
 				successVotes++
 			}
