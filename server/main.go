@@ -257,15 +257,21 @@ out:
 			serverDownTimer = time.After(serverDownTimeout)
 			electionCancel <- struct{}{}
 		case r.State = <-r.stateTransition:
-			log.Println("I won election, sending heartbeat")
+			if r.State == Leader {
+				log.Println("I won election, sending heartbeat")
 
-			// Reset all the timers, and trigger the heart beat timer.
-			electionTimer = nil
-			serverDownTimer = nil
+				// Reset all the timers, and trigger the heart beat timer.
+				electionTimer = nil
+				serverDownTimer = nil
 
-			go r.sendHeatBeat()
+				go r.sendHeatBeat()
 
-			heartBeatTimer = time.After(heartBeatTimeout)
+				heartBeatTimer = time.After(heartBeatTimeout)
+			} else {
+				log.Println("no winner of election, going back to follower")
+
+				serverDownTimer = time.After(serverDownTimeout)
+			}
 		case <-r.quit:
 			break out
 		}
@@ -333,7 +339,7 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 		case <-cancelSignal:
 			return
 		case <-electionTimeout:
-			go s.startElection(cancelSignal, time.After(timeoutDuration), timeoutDuration)
+			s.stateTransition <- Follower
 			return
 		case reply := <-response:
 			if reply.VoteGranted {
