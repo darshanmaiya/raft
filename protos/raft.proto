@@ -19,7 +19,7 @@ message PostResponse {
 message LookupArgs {
 }
 message LookupResponse {
-    repeated string messages = 1;
+    repeated LogEntry entries = 1;
 }
 
 message RequestVoteArgs {
@@ -74,4 +74,10 @@ message AppendEntriesResponse {
 message LogEntry {
     uint32 term = 1;
     string msg = 2;
+	ConfigChange configChange = 3;
+}
+
+message ConfigChange {
+	string command = 1;
+	map<uint32, string> servers = 2;
 }
