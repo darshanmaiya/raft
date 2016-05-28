@@ -160,17 +160,29 @@ func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupRe
 	return &raft.LookupResponse{}, nil
 }
 
+func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigResponse, error) {
+
+	return &raft.ConfigResponse{
+		Success: true,
+		Message: "Config changed sucessfully",
+	}, nil
+}
+
 func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raft.RequestVoteResponse, error) {
 	var granted bool
 
 	// If we've already voted for a new candidate during this term, then
 	// decline the request, otherwise accept this as a new candidate and
 	// record our vote.
-	if req.Term < s.CurrentTerm || s.VotedFor != -1 || s.State == Candidate {
+	// TODO (darshanmaiya): Check race condition here with s.State
+	if req.Term < s.CurrentTerm || s.VotedFor != -1 || s.State != Follower {
 		granted = false
 	} else {
 		s.VotedFor = int32(req.CandidateId)
+		s.CurrentTerm = req.Term
 		granted = true
+
+		s.msgReceived <- struct{}{}
 	}
 
 	fmt.Printf("Server %d is requesting vote..\n", req.CandidateId)
@@ -184,7 +196,7 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 	// If we get a heart beat with an empty log and we're a candidate, then we
 	// lost the election.
 	if s.State == Candidate && len(req.Entries) == 0 {
-		log.Println("I lost the election")
+		log.Printf("I lost the election because I received an empty AppendEntries from Server %d\n", req.LeaderId)
 		s.electionLost <- struct{}{}
 	}
 
@@ -215,8 +227,8 @@ var (
 )
 
 func (r *Raft) coordinator() {
-	serverDownTimeout := 1500 * time.Millisecond
-	heartBeatTimeout := 1000 * time.Millisecond
+	serverDownTimeout := 150 * time.Millisecond
+	heartBeatTimeout := 100 * time.Millisecond
 
 	// TODO(roasbeef): possible goroutine leak by just
 	// using time.After?
@@ -231,7 +243,7 @@ out:
 		case <-serverDownTimer:
 			// Haven't received message from leader in serverDownTimeout
 			// period. So start an election after a random period of time.
-			electionBackOff := time.Duration(rand.Intn(1400)+100) * time.Millisecond
+			electionBackOff := time.Duration(rand.Intn(140)+10) * time.Millisecond
 
 			log.Printf("haven't heard from header, backing off to election: %v\n",
 				electionBackOff)
@@ -242,6 +254,10 @@ out:
 
 			electionTimeout := time.After(serverDownTimeout)
 			serverDownTimer = nil
+
+			r.CurrentTerm++
+			r.VotedFor = -1
+
 			electionCancel = make(chan struct{}, 1)
 			go r.startElection(electionCancel, electionTimeout, serverDownTimeout)
 		case <-heartBeatTimer:
@@ -257,6 +273,9 @@ out:
 			// up. So reset it.
 			serverDownTimer = time.After(serverDownTimeout)
 		case <-r.electionLost:
+			if electionCancel != nil {
+				electionCancel <- struct{}{}
+			}
 			log.Println("I lost the election, switching to follower")
 			if electionCancel != nil {
 				electionCancel <- struct{}{}
@@ -281,8 +300,9 @@ out:
 
 				heartBeatTimer = time.After(heartBeatTimeout)
 			} else {
+				// This is triggered when there was a stalemate in the election
 				log.Println("no winner of election, going back to follower")
-
+				r.VotedFor = -1
 				serverDownTimer = time.After(serverDownTimeout)
 			}
 		case <-r.quit:
