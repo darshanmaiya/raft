@@ -139,6 +139,26 @@ func main() {
 				break
 			}
 			fmt.Println("Config...")
+			op := input[1]
+			numServers, _ := strconv.Atoi(input[2])
+			newServers := make(map[uint32]string)
+			for serverIps := 0; serverIps < numServers; serverIps++ {
+				newServers[uint32(serverIps)] = input[3+serverIps]
+			}
+
+			args := &raft.ConfigArgs{
+				NewConfig: &raft.ConfigChange{
+					Command: op,
+					Servers: newServers,
+				},
+			}
+
+			reply, err := client.Config(context.Background(), args)
+			if err != nil {
+				log.Fatal("Server error:", err)
+			}
+
+			fmt.Println("Reply from server:\n", reply.Message)
 
 		default:
 			fmt.Printf("Unknown command: %s\n", input[0])
@@ -156,7 +176,7 @@ func main() {
 			fmt.Println("\nRaft Client commands\n--------------------------------")
 			fmt.Println("post <Message> - Post a message")
 			fmt.Println("lookup - Display the posts in server in causal order")
-			fmt.Println("config <add/remove> <number of nodes> <new serverips> - Change config to specified number of nodes")
+			fmt.Println("config <add/remove/change> <number of servers> <new serverips> - Change config to specified number of nodes")
 
 			fmt.Println("\nMisc. commands\n--------------------------------")
 			fmt.Println("help - Display all supported commands")

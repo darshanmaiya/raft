@@ -5,6 +5,7 @@ package raft;
 service Raft {
     rpc Post(PostArgs) returns (PostResponse);
     rpc Lookup(LookupArgs) returns (LookupResponse);
+    rpc Config(ConfigArgs) returns (ConfigResponse);
     rpc RequestVote(RequestVoteArgs) returns (RequestVoteResponse);
     rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesResponse);
 }
@@ -20,6 +21,14 @@ message LookupArgs {
 }
 message LookupResponse {
     repeated LogEntry entries = 1;
+}
+
+message ConfigArgs {
+	ConfigChange newConfig = 1;
+}
+message ConfigResponse {
+    bool success = 1;
+	string message = 2;
 }
 
 message RequestVoteArgs {
