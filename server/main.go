@@ -42,7 +42,7 @@ type Raft struct {
 
 	// VotedFor is the candidateId that received vote in current term (or
 	// null if none)
-	VotedFor *uint32
+	VotedFor int32
 
 	// Log is all log entries. Each entry contains command for state
 	// machine, and term when entry was received by leader (first index is 1)
@@ -77,10 +77,15 @@ type Raft struct {
 	electionLost chan struct{}
 	msgReceived  chan struct{}
 
-	nodes map[uint32]raft.RaftClient
+	nodes map[uint32]*rpcConn
 
 	wg   sync.WaitGroup
 	quit chan struct{}
+}
+
+type rpcConn struct {
+	conn   *grpc.ClientConn
+	client raft.RaftClient
 }
 
 // newRaft creates a new instance of raft given its server id.
@@ -98,7 +103,7 @@ func newRaft(serverID uint32) (*Raft, error) {
 		electionLost: make(chan struct{}, 1),
 		msgReceived:  make(chan struct{}, 1),
 
-		nodes: make(map[uint32]raft.RaftClient),
+		nodes: make(map[uint32]*rpcConn),
 
 		quit: make(chan struct{}, 1),
 	}
@@ -119,9 +124,8 @@ func newRaft(serverID uint32) (*Raft, error) {
 		}
 
 		var opts []grpc.DialOption
-		// TODO(roasbeef): add goroutine to poll state of all
-		// connections and reconnect (will need mutex).
 		opts = append(opts, grpc.WithInsecure())
+		opts = append(opts, grpc.WithBlock())
 		opts = append(opts, grpc.WithTimeout(time.Minute*5))
 		conn, err := grpc.Dial(server, opts...)
 		if err != nil {
@@ -129,7 +133,10 @@ func newRaft(serverID uint32) (*Raft, error) {
 		}
 
 		client := raft.NewRaftClient(conn)
-		s.nodes[uint32(i)] = client
+		s.nodes[uint32(i)] = &rpcConn{
+			conn:   conn,
+			client: client,
+		}
 	}
 
 	fmt.Println("Participant servers initialized successfully.")
@@ -159,10 +166,10 @@ func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raf
 	// If we've already voted for a new candidate during this term, then
 	// decline the request, otherwise accept this as a new candidate and
 	// record our vote.
-	if req.Term < s.CurrentTerm || s.VotedFor != nil || s.State == Candidate {
+	if req.Term < s.CurrentTerm || s.VotedFor != -1 || s.State == Candidate {
 		granted = false
 	} else {
-		s.VotedFor = &req.CandidateId
+		s.VotedFor = int32(req.CandidateId)
 		granted = true
 	}
 
@@ -181,7 +188,9 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 		s.electionLost <- struct{}{}
 	}
 
-	s.msgReceived <- struct{}{}
+	if s.State != Leader {
+		s.msgReceived <- struct{}{}
+	}
 
 	return &raft.AppendEntriesResponse{}, nil
 }
@@ -215,8 +224,7 @@ func (r *Raft) coordinator() {
 	var electionTimer <-chan time.Time
 	var heartBeatTimer <-chan time.Time
 
-	electionCancel := make(chan struct{}, 1)
-
+	var electionCancel chan struct{}
 out:
 	for {
 		select {
@@ -234,6 +242,7 @@ out:
 
 			electionTimeout := time.After(serverDownTimeout)
 			serverDownTimer = nil
+			electionCancel = make(chan struct{}, 1)
 			go r.startElection(electionCancel, electionTimeout, serverDownTimeout)
 		case <-heartBeatTimer:
 			// Send out heart beats to all participants, and reset the
@@ -249,13 +258,17 @@ out:
 			serverDownTimer = time.After(serverDownTimeout)
 		case <-r.electionLost:
 			log.Println("I lost the election, switching to follower")
+			if electionCancel != nil {
+				electionCancel <- struct{}{}
+			}
+
 			r.State = Follower
 
 			// The election was lost, cancel the election timer.
 			electionTimer = nil
 			heartBeatTimer = nil
+			electionCancel = nil
 			serverDownTimer = time.After(serverDownTimeout)
-			electionCancel <- struct{}{}
 		case r.State = <-r.stateTransition:
 			if r.State == Leader {
 				log.Println("I won election, sending heartbeat")
@@ -291,7 +304,7 @@ func (s *Raft) sendHeatBeat() {
 			if _, err := n.AppendEntries(context.Background(), args); err != nil {
 				log.Fatalf("Server during heartbeat error:", err)
 			}
-		}(node)
+		}(node.client)
 	}
 }
 
@@ -306,6 +319,17 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 	successVotes := 1
 
 	for _, node := range s.nodes {
+		// If the connection isn't in the ready state, then it isn't
+		// eligible for voting.
+		connState, err := node.conn.State()
+		if err != nil {
+			continue
+		}
+		if connState != grpc.Ready {
+			continue
+
+		}
+
 		go func(n raft.RaftClient) {
 			term := uint32(0)
 			args := &raft.RequestVoteArgs{
@@ -331,7 +355,7 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 					VoteGranted: reply.VoteGranted,
 				}
 			}
-		}(node)
+		}(node.client)
 	}
 
 	for i := 0; i < len(s.Participants); i++ {
