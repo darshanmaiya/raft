@@ -153,6 +153,14 @@ func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupRe
 	return &raft.LookupResponse{}, nil
 }
 
+func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigResponse, error) {
+
+	return &raft.ConfigResponse{
+		Success: true,
+		Message: "Config changed sucessfully",
+	}, nil
+}
+
 func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raft.RequestVoteResponse, error) {
 	var granted bool
 

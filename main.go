@@ -158,7 +158,7 @@ func main() {
 				log.Fatal("Server error:", err)
 			}
 
-			fmt.Println("Reply from server:\n", reply.Message)
+			fmt.Printf("Reply from server:\n%s\n", reply.Message)
 
 		default:
 			fmt.Printf("Unknown command: %s\n", input[0])
