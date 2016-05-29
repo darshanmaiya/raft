@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -125,7 +126,7 @@ func newRaft(serverID uint32) (*Raft, error) {
 
 		var opts []grpc.DialOption
 		opts = append(opts, grpc.WithInsecure())
-		opts = append(opts, grpc.WithBlock())
+		opts = append(opts, grpc.WithBackoffConfig(grpc.BackoffConfig{MaxDelay: 100 * time.Millisecond}))
 		opts = append(opts, grpc.WithTimeout(time.Minute*5))
 		conn, err := grpc.Dial(server, opts...)
 		if err != nil {
@@ -157,7 +158,9 @@ func (s *Raft) Post(ctx context.Context, req *raft.PostArgs) (*raft.PostResponse
 
 func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupResponse, error) {
 
-	return &raft.LookupResponse{}, nil
+	return &raft.LookupResponse{
+		Entries: s.Log,
+	}, nil
 }
 
 func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigResponse, error) {
@@ -245,11 +248,11 @@ out:
 			// period. So start an election after a random period of time.
 			electionBackOff := time.Duration(rand.Intn(140)+10) * time.Millisecond
 
-			log.Printf("haven't heard from header, backing off to election: %v\n",
+			log.Printf("Haven't heard from the leader, backing off to election: %v\n",
 				electionBackOff)
 			electionTimer = time.After(electionBackOff)
 		case <-electionTimer:
-			log.Println("election back off triggered, requesting votes")
+			log.Println("Election back off triggered, requesting votes")
 			r.State = Candidate
 
 			electionTimeout := time.After(serverDownTimeout)
@@ -268,7 +271,7 @@ out:
 
 			heartBeatTimer = time.After(heartBeatTimeout)
 		case <-r.msgReceived:
-			log.Println("received heartbeat, leader is still up")
+			log.Println("Received heartbeat, leader is still up")
 			// We got a message from the leader before the timeout was
 			// up. So reset it.
 			serverDownTimer = time.After(serverDownTimeout)
@@ -333,7 +336,6 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 
 	fmt.Println("Sending RequestVoteRPC...")
 
-	// +1 not required as self vote is always assumed
 	majority := (len(s.Participants) / 2) + 1
 	response := make(chan raft.RequestVoteResponse, len(s.Participants))
 	successVotes := 1
@@ -403,6 +405,11 @@ func main() {
 	rand.Seed(time.Now().Unix())
 
 	flag.Parse()
+
+	// Redirect the output of grpcLog to a file instead of stdout
+	grpcLogFile, _ := os.OpenFile(fmt.Sprintf("server%d.log", *serverID), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+	newLogger := log.New(grpcLogFile, "[grpclog] ", 0)
+	grpclog.SetLogger(newLogger)
 
 	raftServer, err := newRaft(uint32(*serverID))
 	if err != nil {
