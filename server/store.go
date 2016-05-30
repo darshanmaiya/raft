@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"github.com/golang/protobuf/proto"
 
@@ -75,37 +76,88 @@ func (m *MetaStore) FetchState() (NodeState, error) {
 	var state NodeState
 	err := m.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(metaBucket)
-		state = NodeState(b.Get(stateKey)[0])
+		stateByte := b.Get(stateKey)
+		if stateByte == nil {
+			state = Follower
+		} else {
+			state = NodeState(stateByte[0])
+		}
+
 		return nil
 	})
 	if err != nil {
 		return 0, nil
 	}
+	fmt.Println("state: ", state)
 
 	return state, nil
 }
 
 func (m *MetaStore) UpdateCurrentTerm(newTerm uint32) error {
-	var scratch [4]byte
+	scratch := make([]byte, 4)
 	return m.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(metaBucket)
 		endian.PutUint32(scratch[:], newTerm)
-		return b.Put(termKey, scratch[:])
+		fmt.Println("update new term: ", newTerm)
+		return b.Put(termKey, scratch)
 	})
 }
 
-func (m *MetaStore) FetchCurrentTerm() (int32, error) {
-	var term int32
+func (m *MetaStore) IncrementTerm() error {
+	scratch := make([]byte, 4)
+
+	var newTerm uint32
+	return m.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(metaBucket)
+		termBytes := b.Get(termKey)
+
+		fmt.Println("term bytes: ", termBytes)
+
+		if termBytes == nil {
+			fmt.Println("fresh term")
+			newTerm = 0
+		} else {
+			oldTerm := endian.Uint32(termBytes)
+			newTerm = oldTerm + 1
+			fmt.Println("old term: ", oldTerm)
+			fmt.Println("new term: ", newTerm)
+		}
+
+		fmt.Println("incremented new term: ", newTerm)
+
+		endian.PutUint32(scratch[:], newTerm)
+
+		fmt.Println("term post bytes: ", scratch)
+		if err := b.Put(termKey, scratch); err != nil {
+			return nil
+		}
+
+		readBytes := b.Get(termKey)
+		fmt.Println("read again: ", readBytes)
+
+		return nil
+	})
+}
+
+func (m *MetaStore) FetchCurrentTerm() (uint32, error) {
+	var term uint32
 	err := m.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(metaBucket)
 		termBytes := b.Get(termKey)
-		term = int32(endian.Uint32(termBytes))
+
+		fmt.Println("term bytes: ", termBytes)
+
+		if termBytes != nil {
+			term = endian.Uint32(termBytes)
+		}
 
 		return nil
 	})
 	if err != nil {
-		return term, nil
+		return term, err
 	}
+
+	fmt.Println("term: ", term)
 
 	return term, nil
 }
@@ -116,6 +168,7 @@ func (m *MetaStore) UpdateVotedFor(newTerm int32) error {
 		b := tx.Bucket(metaBucket)
 
 		endian.PutUint32(scratch[:], uint32(newTerm))
+		fmt.Println("new voted for: ", newTerm)
 		return b.Put(termKey, scratch[:])
 	})
 }
@@ -135,6 +188,7 @@ func (m *MetaStore) FetchVotedFor() (int32, error) {
 	if err != nil {
 		return votedFor, err
 	}
+	fmt.Println("voted for: ", votedFor)
 
 	return votedFor, nil
 }
@@ -182,6 +236,10 @@ func (l *LogStore) FetchEntry(index uint32) (*raft.LogEntry, error) {
 	err := l.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(logBucket)
 		bytes := b.Get(bytesIndex[:])
+		if bytes == nil {
+			return nil
+		}
+
 		return proto.Unmarshal(bytes, entry)
 	})
 	if err != nil {
@@ -232,4 +290,51 @@ func (l *LogStore) RemoveEntry(index uint32) error {
 	}
 
 	return err
+}
+
+func (l *LogStore) FetchAllEntries() ([]*raft.LogEntry, error) {
+	var entries []*raft.LogEntry
+
+	// TODO(roasbeef): will duplicate last entry
+	err := l.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(logBucket)
+
+		b.ForEach(func(k, v []byte) error {
+			entry := &raft.LogEntry{}
+			if err := proto.Unmarshal(v, entry); err != nil {
+				return err
+			}
+
+			entries = append(entries, entry)
+			return nil
+		})
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+func (l *LogStore) LogLength() (uint32, error) {
+	var length uint32
+	err := l.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(logBucket)
+		tipBytes := b.Get(lastIndex)
+
+		if tipBytes == nil {
+			length = 0
+		} else {
+			length = endian.Uint32(tipBytes)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return 0, nil
+	}
+
+	return length, nil
 }
