@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/boltdb/bolt"
 	"github.com/darshanmaiya/raft/config"
 	"github.com/darshanmaiya/raft/protos"
 	"golang.org/x/net/context"
@@ -30,24 +31,11 @@ const (
 // Raft represents an instance of raft implementing the gRPC
 // server interface.
 type Raft struct {
-	// Persistent state on all servers:
-	//
-	// (Updated on stable storage before responding to RPCs)
 	ServerID uint32
 	Port     string
-	State    NodeState
 
-	// CurrentTerm is the latest term server has seen (initialized to 0 on
-	// first boot, increases monotonically)
-	CurrentTerm uint32
-
-	// VotedFor is the candidateId that received vote in current term (or
-	// null if none)
-	VotedFor int32
-
-	// Log is all log entries. Each entry contains command for state
-	// machine, and term when entry was received by leader (first index is 1)
-	Log []*raft.LogEntry
+	logStore  *LogStore
+	metaStore *MetaStore
 
 	// Volatile state on all servers:
 	//
@@ -91,9 +79,25 @@ type rpcConn struct {
 
 // newRaft creates a new instance of raft given its server id.
 func newRaft(serverID uint32) (*Raft, error) {
+	db, err := bolt.Open(fmt.Sprintf("log-%d.db", serverID), 0600, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	metaStore, err := NewMetaStore(db)
+	if err != nil {
+		return nil, err
+	}
+
+	logStore, err := NewLogStore(db)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Raft{
 		ServerID:     serverID,
-		State:        Follower,
+		logStore:     logStore,
+		metaStore:    metaStore,
 		Participants: make(map[int]string),
 
 		NextIndex:  make(map[int]uint32),
@@ -110,7 +114,6 @@ func newRaft(serverID uint32) (*Raft, error) {
 	}
 
 	// Get the map of participants from the global config.
-	var err error
 	s.Participants, err = config.GetServersFromConfig()
 	if err != nil {
 		return nil, err
@@ -158,8 +161,13 @@ func (s *Raft) Post(ctx context.Context, req *raft.PostArgs) (*raft.PostResponse
 
 func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupResponse, error) {
 
+	entries, err := s.logStore.FetchAllEntries()
+	if err != nil {
+		return nil, err
+	}
+
 	return &raft.LookupResponse{
-		Entries: s.Log,
+		Entries: entries,
 	}, nil
 }
 
@@ -177,12 +185,31 @@ func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raf
 	// If we've already voted for a new candidate during this term, then
 	// decline the request, otherwise accept this as a new candidate and
 	// record our vote.
-	// TODO (darshanmaiya): Check race condition here with s.State
-	if req.Term < s.CurrentTerm || s.VotedFor != -1 || s.State != Follower {
+	currentTerm, err := s.metaStore.FetchCurrentTerm()
+	if err != nil {
+		return nil, err
+	}
+	state, err := s.metaStore.FetchState()
+	if err != nil {
+		return nil, err
+	}
+	votedFor, err := s.metaStore.FetchVotedFor()
+	if err != nil {
+		return nil, err
+	}
+
+	if req.Term < uint32(currentTerm) || votedFor != -1 || state != Follower {
 		granted = false
 	} else {
-		s.VotedFor = int32(req.CandidateId)
-		s.CurrentTerm = req.Term
+		if err := s.metaStore.UpdateCurrentTerm(req.Term); err != nil {
+			return nil, err
+		}
+		currentTerm = req.Term
+
+		if err := s.metaStore.UpdateVotedFor(int32(req.CandidateId)); err != nil {
+			return nil, err
+		}
+
 		granted = true
 
 		s.msgReceived <- struct{}{}
@@ -190,20 +217,25 @@ func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raf
 
 	fmt.Printf("Server %d is requesting vote..\n", req.CandidateId)
 	return &raft.RequestVoteResponse{
-		Term:        s.CurrentTerm,
+		Term:        uint32(currentTerm),
 		VoteGranted: granted,
 	}, nil
 }
 
 func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (*raft.AppendEntriesResponse, error) {
+	state, err := s.metaStore.FetchState()
+	if err != nil {
+		return nil, err
+	}
+
 	// If we get a heart beat with an empty log and we're a candidate, then we
 	// lost the election.
-	if s.State == Candidate && len(req.Entries) == 0 {
+	if state == Candidate && len(req.Entries) == 0 {
 		log.Printf("I lost the election because I received an empty AppendEntries from Server %d\n", req.LeaderId)
 		s.electionLost <- struct{}{}
 	}
 
-	if s.State != Leader {
+	if state != Leader {
 		s.msgReceived <- struct{}{}
 	}
 
@@ -253,13 +285,19 @@ out:
 			electionTimer = time.After(electionBackOff)
 		case <-electionTimer:
 			log.Println("Election back off triggered, requesting votes")
-			r.State = Candidate
+			if err := r.metaStore.UpdateState(Candidate); err != nil {
+				log.Println("unable to update state")
+			}
 
 			electionTimeout := time.After(serverDownTimeout)
 			serverDownTimer = nil
 
-			r.CurrentTerm++
-			r.VotedFor = -1
+			if err := r.metaStore.IncrementTerm(); err != nil {
+				log.Println("unable to increment term")
+			}
+			if err := r.metaStore.UpdateVotedFor(-1); err != nil {
+				log.Println("unable to update voted for")
+			}
 
 			electionCancel = make(chan struct{}, 1)
 			go r.startElection(electionCancel, electionTimeout, serverDownTimeout)
@@ -284,15 +322,21 @@ out:
 				electionCancel <- struct{}{}
 			}
 
-			r.State = Follower
+			if err := r.metaStore.UpdateState(Follower); err != nil {
+				log.Println("unable to update state")
+			}
 
 			// The election was lost, cancel the election timer.
 			electionTimer = nil
 			heartBeatTimer = nil
 			electionCancel = nil
 			serverDownTimer = time.After(serverDownTimeout)
-		case r.State = <-r.stateTransition:
-			if r.State == Leader {
+		case newState := <-r.stateTransition:
+			if err := r.metaStore.UpdateState(newState); err != nil {
+				log.Println("unable to update state")
+			}
+
+			if newState == Leader {
 				log.Println("I won election, sending heartbeat")
 
 				// Reset all the timers, and trigger the heart beat timer.
@@ -305,7 +349,9 @@ out:
 			} else {
 				// This is triggered when there was a stalemate in the election
 				log.Println("no winner of election, going back to follower")
-				r.VotedFor = -1
+				if err := r.metaStore.UpdateVotedFor(-1); err != nil {
+					log.Println("unable to update voted for")
+				}
 				serverDownTimer = time.After(serverDownTimeout)
 			}
 		case <-r.quit:
@@ -317,11 +363,17 @@ out:
 }
 
 func (s *Raft) sendHeatBeat() {
+	term, err := s.metaStore.FetchCurrentTerm()
+	if err != nil {
+		log.Println("unable to fetch term")
+		return
+	}
+
 	for _, node := range s.nodes {
 		go func(n raft.RaftClient) {
 			args := &raft.AppendEntriesArgs{
-				Term:     s.CurrentTerm,
-				LeaderId: s.CurrentTerm,
+				Term:     uint32(term),
+				LeaderId: s.ServerID,
 			}
 
 			if _, err := n.AppendEntries(context.Background(), args); err != nil {
@@ -340,6 +392,26 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 	response := make(chan raft.RequestVoteResponse, len(s.Participants))
 	successVotes := 1
 
+	term, err := s.metaStore.FetchCurrentTerm()
+	if err != nil {
+		log.Println("unable to get current term")
+	}
+	logLength, err := s.logStore.LogLength()
+	if err != nil {
+		log.Println("unable to get log length")
+	}
+	lastEntry, err := s.logStore.FetchEntry(logLength - 1)
+	if err != nil {
+		log.Println("unable to fetch entry")
+	}
+
+	var lastTerm uint32
+	if lastEntry == nil {
+		lastTerm = 0
+	} else {
+		lastTerm = lastEntry.Term
+	}
+
 	for _, node := range s.nodes {
 		// If the connection isn't in the ready state, then it isn't
 		// eligible for voting.
@@ -353,16 +425,12 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 		}
 
 		go func(n raft.RaftClient) {
-			term := uint32(0)
 			args := &raft.RequestVoteArgs{
-				Term:         s.CurrentTerm,
+				Term:         term,
 				CandidateId:  s.ServerID,
-				LastLogIndex: uint32(len(s.Log)),
+				LastLogIndex: logLength,
 			}
-			if s.Log != nil {
-				term = s.Log[len(s.Log)-1].Term
-			}
-			args.LastLogTerm = uint32(term)
+			args.LastLogTerm = lastTerm
 			fmt.Println("Sending request vote...")
 			reply, err := n.RequestVote(context.Background(), args)
 			fmt.Println("Received request vote...")
