@@ -161,7 +161,7 @@ func (l *LogStore) FetchTip() (*raft.LogEntry, error) {
 
 	err := l.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(logBucket)
-		tipBytes := b.Get(tipKey)
+		tipBytes := b.Get(lastIndex)
 		protoBytes := b.Get(tipBytes)
 		return proto.Unmarshal(protoBytes, tip)
 	})
