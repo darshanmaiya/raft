@@ -165,9 +165,33 @@ func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupRe
 
 func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigResponse, error) {
 
+	// TODO AppendEntries here
+
+	// Change the config
+	if req.NewConfig.Command == "add" {
+		for servId, servIp := range req.NewConfig.Servers {
+			s.Participants[int(servId)] = servIp
+		}
+	} else if req.NewConfig.Command == "remove" {
+		for servId, _ := range req.NewConfig.Servers {
+			delete(s.Participants, int(servId))
+		}
+	} else {
+		s.Participants = make(map[int]string)
+		for servId, servIp := range req.NewConfig.Servers {
+			s.Participants[int(servId)] = servIp
+		}
+	}
+
+	newConfig := make(map[uint32]string)
+	for servId, servIp := range s.Participants {
+		newConfig[uint32(servId)] = servIp
+	}
+
 	return &raft.ConfigResponse{
 		Success: true,
 		Message: "Config changed sucessfully",
+		Servers: newConfig,
 	}, nil
 }
 

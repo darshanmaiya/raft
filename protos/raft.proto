@@ -29,6 +29,7 @@ message ConfigArgs {
 message ConfigResponse {
     bool success = 1;
 	string message = 2;
+	map<uint32, string> servers = 3;
 }
 
 message RequestVoteArgs {

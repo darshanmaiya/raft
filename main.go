@@ -18,6 +18,7 @@ import (
 )
 
 var allServers map[int]string
+var serverToIdMap map[string]int
 var conn *grpc.ClientConn
 var client raft.RaftClient
 var connectedToServer uint32
@@ -32,6 +33,11 @@ func main() {
 	allServers, err = config.GetServersFromConfig()
 	if err != nil {
 		os.Exit(1)
+	}
+
+	serverToIdMap = make(map[string]int)
+	for servId, servIp := range allServers {
+		serverToIdMap[servIp] = servId
 	}
 
 	fmt.Println("Servers initialized successfully.")
@@ -138,12 +144,22 @@ func main() {
 				fmt.Println("The server connected to is not responding.")
 				break
 			}
-			fmt.Println("Config...")
+
 			op := input[1]
 			numServers, _ := strconv.Atoi(input[2])
 			newServers := make(map[uint32]string)
-			for serverIps := 0; serverIps < numServers; serverIps++ {
-				newServers[uint32(serverIps)] = input[3+serverIps]
+			if op == "add" {
+				for serverIps := 0; serverIps < numServers; serverIps++ {
+					newServers[uint32(len(allServers))+uint32(serverIps)] = input[3+serverIps]
+				}
+			} else if op == "remove" {
+				for serverIps := 0; serverIps < numServers; serverIps++ {
+					newServers[uint32(serverToIdMap[input[3+serverIps]])] = input[3+serverIps]
+				}
+			} else {
+				for serverIps := 0; serverIps < numServers; serverIps++ {
+					newServers[uint32(serverIps)] = input[3+serverIps]
+				}
 			}
 
 			args := &raft.ConfigArgs{
@@ -158,7 +174,17 @@ func main() {
 				log.Fatal("Server error:", err)
 			}
 
-			fmt.Printf("Reply from server:\n%s\n", reply.Message)
+			fmt.Printf("Reply from server: \"%s\"\n", reply.Message)
+			if reply.Success {
+				allServers = make(map[int]string)
+				serverToIdMap = make(map[string]int)
+				for servId, servIp := range reply.Servers {
+					allServers[int(servId)] = servIp
+					serverToIdMap[servIp] = int(servId)
+				}
+			}
+
+			listServers(allServers)
 
 		default:
 			fmt.Printf("Unknown command: %s\n", input[0])
