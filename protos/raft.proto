@@ -14,7 +14,9 @@ message PostArgs {
     string msg = 1;
 }
 message PostResponse {
-    string resp = 1;
+	bool success = 1;
+    string resp = 2;
+	uint32 leaderId = 3;
 }
 
 message LookupArgs {

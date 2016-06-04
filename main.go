@@ -15,6 +15,7 @@ import (
 
 	"github.com/darshanmaiya/raft/config"
 	"github.com/darshanmaiya/raft/protos"
+	"google.golang.org/grpc/grpclog"
 )
 
 var allServers map[int]string
@@ -42,6 +43,11 @@ func main() {
 
 	fmt.Println("Servers initialized successfully.")
 	listServers(allServers)
+
+	// Redirect the output of grpcLog to a file instead of stdout
+	grpcLogFile, _ := os.OpenFile(fmt.Sprintf("client.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+	newLogger := log.New(grpcLogFile, "[grpclog] ", 0)
+	grpclog.SetLogger(newLogger)
 
 	for {
 		consoleReader := bufio.NewReader(os.Stdin)

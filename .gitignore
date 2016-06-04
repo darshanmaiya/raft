@@ -1,3 +1,5 @@
 server/server
 raft
 server/*.log
+server/log*.db
+client.log

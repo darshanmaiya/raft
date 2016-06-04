@@ -61,6 +61,9 @@ type Raft struct {
 	// Participants is the set of all participating servers in Raft.
 	Participants map[int]string
 
+	// Leader ID from whom the last message was received
+	LeaderId int
+
 	stateTransition chan NodeState
 
 	electionLost chan struct{}
@@ -102,6 +105,8 @@ func newRaft(serverID uint32) (*Raft, error) {
 
 		NextIndex:  make(map[int]uint32),
 		MatchIndex: make(map[int]uint32),
+
+		LeaderId: -1,
 
 		stateTransition: make(chan NodeState, 1),
 
@@ -156,6 +161,36 @@ func (r *Raft) Start() error {
 }
 
 func (s *Raft) Post(ctx context.Context, req *raft.PostArgs) (*raft.PostResponse, error) {
+	state, err := s.metaStore.FetchState()
+	if err != nil {
+		return &raft.PostResponse{}, err
+	}
+
+	if state == Candidate {
+		// State is candidate, wait for a signal before responding
+		select {
+		case <-s.electionLost:
+			break
+		case <-s.stateTransition:
+			break
+		}
+	}
+
+	if state == Follower {
+		return &raft.PostResponse{
+			Success:  false,
+			Resp:     "I'm not the leader",
+			LeaderId: uint32(s.LeaderId),
+		}, nil
+	} else if state == Leader {
+		// AppendEntries here
+		return &raft.PostResponse{
+			Success:  true,
+			Resp:     "Message posted",
+			LeaderId: uint32(s.ServerID),
+		}, nil
+	}
+
 	return &raft.PostResponse{}, nil
 }
 
@@ -256,10 +291,12 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 	// lost the election.
 	if state == Candidate && len(req.Entries) == 0 {
 		log.Printf("I lost the election because I received an empty AppendEntries from Server %d\n", req.LeaderId)
+		s.LeaderId = int(req.LeaderId)
 		s.electionLost <- struct{}{}
 	}
 
 	if state != Leader {
+		s.LeaderId = int(req.LeaderId)
 		s.msgReceived <- struct{}{}
 	}
 
@@ -306,6 +343,7 @@ out:
 
 			log.Printf("Haven't heard from the leader, backing off to election: %v\n",
 				electionBackOff)
+			r.LeaderId = -1
 			electionTimer = time.After(electionBackOff)
 		case <-electionTimer:
 			log.Println("Election back off triggered, requesting votes")
