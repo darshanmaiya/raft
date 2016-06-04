@@ -51,7 +51,7 @@ type Raft struct {
 	// (Reinitialized after election)
 	//
 	// NextIndex marks for each server, index of the next log entry to send
-	// to that server (initialized to leader	last log index + 1)
+	// to that server (initialized to leade	last log index + 1)
 	NextIndex map[int]uint32
 
 	// MatchIndex marks for each server, index of highest log entry known
@@ -65,6 +65,7 @@ type Raft struct {
 	LeaderId int
 
 	stateTransition chan NodeState
+	stateUpdate     chan struct{}
 
 	electionLost chan struct{}
 	msgReceived  chan struct{}
@@ -109,6 +110,7 @@ func newRaft(serverID uint32) (*Raft, error) {
 		LeaderId: -1,
 
 		stateTransition: make(chan NodeState, 1),
+		stateUpdate:     make(chan struct{}),
 
 		electionLost: make(chan struct{}, 1),
 		msgReceived:  make(chan struct{}, 1),
@@ -168,21 +170,28 @@ func (s *Raft) Post(ctx context.Context, req *raft.PostArgs) (*raft.PostResponse
 
 	if state == Candidate {
 		// State is candidate, wait for a signal before responding
-		select {
-		case <-s.electionLost:
-			break
-		case <-s.stateTransition:
-			break
-		}
+		<-s.stateUpdate
 	}
 
 	if state == Follower {
+		log.Println("redirectiong client to leader: ", s.LeaderId)
 		return &raft.PostResponse{
 			Success:  false,
 			Resp:     "I'm not the leader",
 			LeaderId: uint32(s.LeaderId),
 		}, nil
 	} else if state == Leader {
+		// Replicate the new entry to all peers synchronously before we
+		// reply to the client.
+		ok, err := s.replicateEntry(req)
+		if err != nil {
+			log.Println("error replicating entry to follower")
+			return &raft.PostResponse{}, err
+		} else if !ok {
+			log.Println("unable to obtain majority to replicate entries")
+			return &raft.PostResponse{}, fmt.Errorf("unable to get majority")
+		}
+
 		// AppendEntries here
 		return &raft.PostResponse{
 			Success:  true,
@@ -287,20 +296,72 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 		return nil, err
 	}
 
-	// If we get a heart beat with an empty log and we're a candidate, then we
-	// lost the election.
+	// If we get a heart beat with an empty log and we're a candidate, then
+	// we lost the election.
 	if state == Candidate && len(req.Entries) == 0 {
-		log.Printf("I lost the election because I received an empty AppendEntries from Server %d\n", req.LeaderId)
+		log.Printf("I lost the election because I received an empty "+
+			"AppendEntries from Server %d\n", req.LeaderId)
 		s.LeaderId = int(req.LeaderId)
 		s.electionLost <- struct{}{}
 	}
 
+	// If we're not the leader, then reset the server down timer, and also
+	// record the current leader.
 	if state != Leader {
 		s.LeaderId = int(req.LeaderId)
 		s.msgReceived <- struct{}{}
 	}
 
-	return &raft.AppendEntriesResponse{}, nil
+	currentTerm, err := s.metaStore.FetchCurrentTerm()
+	if err != nil {
+		return &raft.AppendEntriesResponse{currentTerm, false}, err
+	}
+
+	// With the initial checks complete, attempt to add this new entry to
+	// our log, responding appropritely.
+	success := true
+	if req.Term < currentTerm {
+		success = false
+		return &raft.AppendEntriesResponse{currentTerm, success}, nil
+	}
+	if req.Term != currentTerm {
+		log.Printf("current term %s is behind leader's term %s, updating\n",
+			currentTerm, req.Term)
+		if err := s.metaStore.UpdateCurrentTerm(req.Term); err != nil {
+			return &raft.AppendEntriesResponse{currentTerm, success}, nil
+		}
+	}
+
+	prevLogEntry, err := s.logStore.FetchEntry(req.PrevLogIndex)
+	if err != nil {
+		return &raft.AppendEntriesResponse{currentTerm, false}, err
+	}
+
+	// If this previous log entry doesn't match the leader's advertised
+	// term, then there's an inconsistency, so return false.
+	if prevLogEntry.Term != req.PrevLogTerm {
+		success = false
+		log.Printf("prev entry has term %s, leader advertised %d \n",
+			prevLogEntry.Term, req.PrevLogTerm)
+		return &raft.AppendEntriesResponse{currentTerm, success}, nil
+	}
+
+	// Check to see if we already have an entry for this index, if so then
+	// delete it and append this one instead.
+	if logEntry, err := s.logStore.FetchEntry(req.LeaderCommit); err != nil {
+		return &raft.AppendEntriesResponse{currentTerm, false}, err
+	} else if logEntry != nil {
+		log.Printf("already have entry at index %d, deleting\n", req.LeaderCommit)
+		if err := s.logStore.RemoveEntry(req.LeaderCommit); err != nil {
+			return &raft.AppendEntriesResponse{currentTerm, false}, err
+		}
+	}
+	log.Println("add new entry at index: ", req.LeaderCommit)
+	if err := s.logStore.AddEntry(req.LeaderCommit, req.Entries[0]); err != nil {
+		return &raft.AppendEntriesResponse{currentTerm, false}, err
+	}
+
+	return &raft.AppendEntriesResponse{currentTerm, success}, nil
 }
 
 func (s *Raft) printParticipants() {
@@ -362,6 +423,7 @@ out:
 			}
 
 			electionCancel = make(chan struct{}, 1)
+			r.stateUpdate = make(chan struct{})
 			go r.startElection(electionCancel, electionTimeout, serverDownTimeout)
 		case <-heartBeatTimer:
 			// Send out heart beats to all participants, and reset the
@@ -408,6 +470,17 @@ out:
 				go r.sendHeatBeat()
 
 				heartBeatTimer = time.After(heartBeatTimeout)
+
+				// Reset the match index, and update the next
+				// index for all followers.
+				logLength, err := r.logStore.LogLength()
+				if err != nil {
+					log.Println("unable to get logindex")
+				}
+				r.MatchIndex = make(map[int]uint32)
+				for nodeId, _ := range r.nodes {
+					r.NextIndex[int(nodeId)] = logLength + 1
+				}
 			} else {
 				// This is triggered when there was a stalemate in the election
 				log.Println("no winner of election, going back to follower")
@@ -416,6 +489,7 @@ out:
 				}
 				serverDownTimer = time.After(serverDownTimeout)
 			}
+			close(r.stateUpdate)
 		case <-r.quit:
 			break out
 		}
@@ -430,12 +504,30 @@ func (s *Raft) sendHeatBeat() {
 		log.Println("unable to fetch term")
 		return
 	}
+	logLength, err := s.logStore.LogLength()
+	if err != nil {
+		log.Println("unable to get log length")
+	}
+	lastEntry, err := s.logStore.FetchEntry(logLength - 1)
+	if err != nil {
+		log.Println("unable to fetch entry")
+	}
+
+	var lastTerm uint32
+	if lastEntry == nil {
+		lastTerm = 0
+	} else {
+		lastTerm = lastEntry.Term
+	}
 
 	for _, node := range s.nodes {
 		go func(n raft.RaftClient) {
 			args := &raft.AppendEntriesArgs{
-				Term:     uint32(term),
-				LeaderId: s.ServerID,
+				Term:         uint32(term),
+				LeaderId:     s.ServerID,
+				PrevLogIndex: logLength - 1,
+				PrevLogTerm:  lastTerm,
+				LeaderCommit: logLength,
 			}
 
 			if _, err := n.AppendEntries(context.Background(), args); err != nil {
@@ -527,6 +619,120 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 				return
 			}
 		}
+	}
+}
+
+func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
+	logLength, err := r.logStore.LogLength()
+	if err != nil {
+		return false, err
+	}
+	lastEntry, err := r.logStore.FetchEntry(logLength - 1)
+	if err != nil {
+		log.Println("unable to fetch entry")
+	}
+
+	var lastTerm uint32
+	if lastEntry == nil {
+		lastTerm = 0
+	} else {
+		lastTerm = lastEntry.Term
+	}
+
+	currentTerm, err := r.metaStore.FetchCurrentTerm()
+	if err != nil {
+		return false, err
+	}
+
+	// First write the new entry into our log.
+	entry := &raft.LogEntry{
+		Term: currentTerm,
+		Msg:  newPost.Msg,
+	}
+	logLength += 1
+	log.Printf("writing new entry at index %s \n", logLength)
+	if err := r.logStore.AddEntry(logLength, entry); err != nil {
+		return false, err
+	}
+
+	// Once we've written out to our local log, replicate the entry to all
+	// followers, doing any re-orgs required to bring them up to date.
+	numSuccess := 0
+	for nodeId, node := range r.nodes {
+		// If the connection isn't in the ready state, then it isn't
+		// eligible for voting.
+		connState, err := node.conn.State()
+		if err != nil {
+			continue
+		}
+		if connState != grpc.Ready {
+			continue
+
+		}
+
+		// Attempt to replicate out this new entry to this follower. In
+		// the case the consistency check fails on the follower side,
+		// we decrement the index we're attempting to replicate and
+		// repeat the process.
+		caughtUp := false
+		for !caughtUp {
+			// Grab the nextIndex for this peer, which is the entry we'll
+			// replicate out.
+			nextIndex := r.NextIndex[int(nodeId)]
+			logEntry, err := r.logStore.FetchEntry(nextIndex)
+			if err != nil {
+				return false, err
+			}
+
+			log.Printf("replicating entry %s to node %s\n",
+				nextIndex, nodeId)
+
+			args := &raft.AppendEntriesArgs{
+				Term:         uint32(currentTerm),
+				LeaderId:     r.ServerID,
+				PrevLogIndex: logLength - 1,
+				PrevLogTerm:  lastTerm,
+				Entries: []*raft.LogEntry{
+					logEntry,
+				},
+				LeaderCommit: logLength,
+			}
+			resp, err := node.client.AppendEntries(context.Background(), args)
+			if err != nil {
+				return false, err
+			}
+
+			// If their reported term is higher then ours, then we
+			// aren't leader. So demote to follower, and cancel this
+			// replication attempt.
+			if resp.Term > currentTerm {
+				log.Println("node had higher term, falling back to follower")
+				r.stateTransition <- Follower
+				return false, nil
+			}
+			if !resp.Success {
+				log.Println("unable to replicate entry: ", nextIndex)
+				r.NextIndex[int(nodeId)] -= 1
+			} else {
+				log.Printf("replicated entry %s\n", nextIndex)
+
+				numSuccess += 1
+				r.NextIndex[int(nodeId)] += 1
+				if r.NextIndex[int(nodeId)] == logLength+1 {
+					log.Printf("node %s is fully caught up\n", nodeId)
+					caughtUp = true
+				}
+			}
+		}
+	}
+
+	majority := (len(r.Participants) / 2) + 1
+	if numSuccess > majority {
+		log.Println("majority obtained")
+		return true, nil
+	} else {
+		log.Println("unable to obtain majority")
+		return false, nil
 	}
 }
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-	"fmt"
 
 	"github.com/golang/protobuf/proto"
 
@@ -88,7 +87,6 @@ func (m *MetaStore) FetchState() (NodeState, error) {
 	if err != nil {
 		return 0, nil
 	}
-	fmt.Println("state: ", state)
 
 	return state, nil
 }
@@ -99,7 +97,6 @@ func (m *MetaStore) UpdateCurrentTerm(newTerm uint32) error {
 
 		b := tx.Bucket(metaBucket)
 		endian.PutUint32(scratch, newTerm)
-		fmt.Println("update new term: ", newTerm)
 		return b.Put(termKey, scratch)
 	})
 }
@@ -113,23 +110,15 @@ func (m *MetaStore) IncrementTerm() error {
 		b := tx.Bucket(metaBucket)
 		termBytes := b.Get(termKey)
 
-		fmt.Println("term bytes: ", termBytes)
-
 		if termBytes == nil {
-			fmt.Println("fresh term")
 			newTerm = 0
 		} else {
 			oldTerm := endian.Uint32(termBytes)
 			newTerm = oldTerm + 1
-			fmt.Println("old term: ", oldTerm)
-			fmt.Println("new term: ", newTerm)
 		}
-
-		fmt.Println("incremented new term: ", newTerm)
 
 		endian.PutUint32(scratch, newTerm)
 
-		fmt.Println("term post bytes: ", scratch)
 		return b.Put(termKey, scratch)
 	})
 }
@@ -139,8 +128,6 @@ func (m *MetaStore) FetchCurrentTerm() (uint32, error) {
 	err := m.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(metaBucket)
 		termBytes := b.Get(termKey)
-
-		fmt.Println("term bytes: ", termBytes)
 
 		if termBytes == nil {
 			term = 0
@@ -154,8 +141,6 @@ func (m *MetaStore) FetchCurrentTerm() (uint32, error) {
 		return 0, err
 	}
 
-	fmt.Println("term: ", term)
-
 	return term, nil
 }
 
@@ -165,7 +150,6 @@ func (m *MetaStore) UpdateVotedFor(newTerm int32) error {
 		b := tx.Bucket(metaBucket)
 
 		endian.PutUint32(scratch[:], uint32(newTerm))
-		fmt.Println("new voted for: ", newTerm)
 		return b.Put(voteKey, scratch[:])
 	})
 }
@@ -185,7 +169,6 @@ func (m *MetaStore) FetchVotedFor() (int32, error) {
 	if err != nil {
 		return votedFor, err
 	}
-	fmt.Println("voted for: ", votedFor)
 
 	return votedFor, nil
 }
