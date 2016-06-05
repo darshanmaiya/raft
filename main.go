@@ -23,6 +23,7 @@ var serverToIdMap map[string]int
 var conn *grpc.ClientConn
 var client raft.RaftClient
 var connectedToServer uint32
+var totalServers int
 
 func main() {
 	fmt.Println("Welcome to Raft by Syncinators.\nType 'help' for a list of supported commands.\n")
@@ -35,6 +36,7 @@ func main() {
 	if err != nil {
 		os.Exit(1)
 	}
+	totalServers = len(allServers)
 
 	serverToIdMap = make(map[string]int)
 	for servId, servIp := range allServers {
@@ -69,36 +71,13 @@ func main() {
 			serverId, err = strconv.Atoi(input[1])
 			if err != nil {
 				fmt.Println("Please pass an integer denoting server ID to connect to.")
-				break
-			}
-			fmt.Printf("Connecting to server %d at %s, please wait...\n", serverId, allServers[serverId])
-			targetServer := allServers[serverId]
-
-			var opts []grpc.DialOption
-			opts = append(opts, grpc.WithInsecure())
-			opts = append(opts, grpc.WithBlock())
-			opts = append(opts, grpc.WithTimeout(time.Second))
-			conn, err = grpc.Dial(targetServer, opts...)
-			if err != nil {
-				fmt.Println("The server to is not responding and maybe down...\nPlease retry after some time")
-				if conn != nil {
-					conn.Close()
-				}
-				client = nil
-				break
+				return
 			}
 
-			client = raft.NewRaftClient(conn)
-			connectedToServer = uint32(serverId)
-			fmt.Printf("Connected to Server %d\n", serverId)
+			connect(serverId)
 
 		case "disconnect":
-			connected := checkConnection(false, true)
-			if connected {
-				conn.Close()
-				client = nil
-				fmt.Printf("Disconnected from Server %d\n", connectedToServer)
-			}
+			disconnect()
 
 		case "list":
 			listServers(allServers)
@@ -112,7 +91,7 @@ func main() {
 			}
 			if getConnectionState() != grpc.Ready {
 				fmt.Println("The server connected to is not responding.")
-				break
+				connect(int(connectedToServer+1) % totalServers)
 			}
 			message := command[5:len(command)]
 			args := &raft.PostArgs{
@@ -122,7 +101,16 @@ func main() {
 			if err != nil {
 				log.Println("Server error:", err)
 			}
-			fmt.Printf("Server replied: \"%s\"\n", reply.Resp)
+			// The requested server is not the leader. Need to connect to the leader
+			if !reply.Response.Success && reply.Response.Message == "I'm not the leader" {
+				fmt.Println("The contacted server is not the leader. Will try to connect to the leader...")
+				connect(int(reply.Response.LeaderId))
+				reply, err = client.Post(context.Background(), args)
+				if err != nil {
+					log.Println("Server error:", err)
+				}
+			}
+			fmt.Printf("Server replied: \"%s\"\n", reply.Response.Message)
 
 		case "lookup":
 			if !checkConnection(false, true) {
@@ -130,7 +118,7 @@ func main() {
 			}
 			if getConnectionState() != grpc.Ready {
 				fmt.Println("The server connected to is not responding.")
-				break
+				connect(int(connectedToServer+1) % totalServers)
 			}
 			args := &raft.LookupArgs{}
 
@@ -138,7 +126,15 @@ func main() {
 			if err != nil {
 				log.Fatal("Server error:", err)
 			}
-
+			// The requested server is not the leader. Need to connect to the leader
+			if !reply.Response.Success && reply.Response.Message == "I'm not the leader" {
+				fmt.Println("The contacted server is not the leader. Will try to connect to the leader...")
+				connect(int(reply.Response.LeaderId))
+				reply, err = client.Lookup(context.Background(), args)
+				if err != nil {
+					log.Println("Server error:", err)
+				}
+			}
 			fmt.Println("Total number of messages in server: ", len(reply.Entries))
 			printLogMessages(reply.Entries)
 
@@ -148,40 +144,30 @@ func main() {
 			}
 			if getConnectionState() != grpc.Ready {
 				fmt.Println("The server connected to is not responding.")
-				break
+				connect(int(connectedToServer+1) % totalServers)
 			}
 
-			op := input[1]
-			numServers, _ := strconv.Atoi(input[2])
-			newServers := make(map[uint32]string)
-			if op == "add" {
-				for serverIps := 0; serverIps < numServers; serverIps++ {
-					newServers[uint32(len(allServers))+uint32(serverIps)] = input[3+serverIps]
-				}
-			} else if op == "remove" {
-				for serverIps := 0; serverIps < numServers; serverIps++ {
-					newServers[uint32(serverToIdMap[input[3+serverIps]])] = input[3+serverIps]
-				}
-			} else {
-				for serverIps := 0; serverIps < numServers; serverIps++ {
-					newServers[uint32(serverIps)] = input[3+serverIps]
-				}
-			}
+			serversList := strings.Split(input[2], ",")
 
 			args := &raft.ConfigArgs{
-				NewConfig: &raft.ConfigChange{
-					Command: op,
-					Servers: newServers,
-				},
+				Servers: serversList,
 			}
 
 			reply, err := client.Config(context.Background(), args)
 			if err != nil {
 				log.Fatal("Server error:", err)
 			}
-
-			fmt.Printf("Reply from server: \"%s\"\n", reply.Message)
-			if reply.Success {
+			// The requested server is not the leader. Need to connect to the leader
+			if !reply.Response.Success && reply.Response.Message == "I'm not the leader" {
+				fmt.Println("The contacted server is not the leader. Will try to connect to the leader...")
+				connect(int(reply.Response.LeaderId))
+				reply, err = client.Config(context.Background(), args)
+				if err != nil {
+					log.Println("Server error:", err)
+				}
+			}
+			fmt.Printf("Reply from server: \"%s\"\n", reply.Response.Message)
+			if reply.Response.Success {
 				allServers = make(map[int]string)
 				serverToIdMap = make(map[string]int)
 				for servId, servIp := range reply.Servers {
@@ -234,7 +220,7 @@ func printLogMessages(messages []*raft.LogEntry) {
 		if value.ConfigChange == nil {
 			fmt.Printf("Log Index: %d, Term: %d, Message: \"%s\"\n", i, value.Term, value.Msg)
 		} else {
-			fmt.Printf("Log Index: %d, Term: %d, Config change: \"%s\"\n", i, value.Term, value.ConfigChange.Command)
+			fmt.Printf("Log Index: %d, Term: %d, Message: Config changed\n", i, value.Term)
 		}
 	}
 }
@@ -262,4 +248,57 @@ func getConnectionState() grpc.ConnectivityState {
 		return grpc.TransientFailure
 	}
 	return state
+}
+
+func connect(serverId int) {
+	var err error
+
+	// Disconnect from any previously connected servers
+	if conn != nil {
+		conn.Close()
+	}
+	client = nil
+
+	fmt.Printf("Connecting to server %d at %s, please wait...\n", serverId, allServers[serverId])
+	targetServer := allServers[serverId]
+
+	var opts []grpc.DialOption
+	opts = append(opts, grpc.WithInsecure())
+	opts = append(opts, grpc.WithBlock())
+	opts = append(opts, grpc.WithTimeout(time.Second))
+	conn, err = grpc.Dial(targetServer, opts...)
+	// Assumption is that at least one server is up, else this will end up in an loop until one of the server comes up
+	if err != nil {
+		fmt.Println("The server is not responding and maybe down...")
+		if conn != nil {
+			conn.Close()
+		}
+		client = nil
+	}
+
+	if err != nil {
+		flag := false
+		for flag == false {
+			serverId++
+			serverId = serverId % totalServers
+			if _, val := allServers[serverId]; val {
+				flag = true
+			}
+		}
+		fmt.Println("Trying to connect to another server...")
+		connect(serverId)
+	} else {
+		client = raft.NewRaftClient(conn)
+		connectedToServer = uint32(serverId)
+		fmt.Printf("Connected to Server %d\n", serverId)
+	}
+}
+
+func disconnect() {
+	connected := checkConnection(false, true)
+	if connected {
+		conn.Close()
+		client = nil
+		fmt.Printf("Disconnected from Server %d\n", connectedToServer)
+	}
 }
