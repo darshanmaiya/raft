@@ -63,12 +63,15 @@ type Raft struct {
 	Participants map[int]string
 	// Reverse mapping of server IPs to IDs
 	ServersToIdMap map[string]int
+	// Next Participant ID
+	NextParticipantId int
 
 	// Leader ID from whom the last message was received
 	LeaderId int
 
-	stateTransition chan NodeState
-	stateUpdate     chan struct{}
+	stateTransition      chan NodeState
+	stateUpdate          chan struct{}
+	configChangeComplete chan struct{}
 
 	electionLost chan struct{}
 	msgReceived  chan struct{}
@@ -104,18 +107,20 @@ func newRaft(serverID uint32) (*Raft, error) {
 	}
 
 	s := &Raft{
-		ServerID:     serverID,
-		logStore:     logStore,
-		metaStore:    metaStore,
-		Participants: make(map[int]string),
+		ServerID:       serverID,
+		logStore:       logStore,
+		metaStore:      metaStore,
+		Participants:   make(map[int]string),
+		ServersToIdMap: make(map[string]int),
 
 		NextIndex:  make(map[int]uint32),
 		MatchIndex: make(map[int]uint32),
 
 		LeaderId: -1,
 
-		stateTransition: make(chan NodeState, 1),
-		stateUpdate:     make(chan struct{}),
+		stateTransition:      make(chan NodeState, 1),
+		stateUpdate:          make(chan struct{}),
+		configChangeComplete: make(chan struct{}),
 
 		electionLost: make(chan struct{}, 1),
 		msgReceived:  make(chan struct{}, 1),
@@ -129,6 +134,10 @@ func newRaft(serverID uint32) (*Raft, error) {
 	s.Participants, err = config.GetServersFromConfig()
 	if err != nil {
 		return nil, err
+	}
+	s.NextParticipantId = len(s.Participants)
+	for i, value := range s.Participants {
+		s.ServersToIdMap[value] = i
 	}
 
 	// Set the port for this server
@@ -254,32 +263,69 @@ func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupRe
 
 func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigResponse, error) {
 
-	// Change the config
-	/*newServers := make(map[int]string)
-
-	serversList := req.Servers
-
-	for i, val := range serversList {
-		if id, ok := s.ServersToIdMap[val]; !ok {
-
-		}
-	}*/
-
-	// TODO AppendEntries here
-
-	newConfig := make(map[uint32]string)
-	for servId, servIp := range s.Participants {
-		newConfig[uint32(servId)] = servIp
+	state, err := s.metaStore.FetchState()
+	if err != nil {
+		return &raft.ConfigResponse{}, err
 	}
 
-	return &raft.ConfigResponse{
-		Response: &raft.RPCResponse{
-			Success:  true,
-			Message:  "Config change request accepted sucessfully",
-			LeaderId: uint32(s.ServerID),
-		},
-		Servers: newConfig,
-	}, nil
+	if state == Candidate {
+		// State is candidate, wait for a signal before responding
+		<-s.stateUpdate
+	}
+
+	if state == Follower {
+		log.Println("redirectiong client to leader: ", s.LeaderId)
+		return &raft.ConfigResponse{
+			Response: &raft.RPCResponse{
+				Success:  false,
+				Message:  "I'm not the leader",
+				LeaderId: uint32(s.LeaderId),
+			},
+		}, nil
+	} else if state == Leader {
+
+		// TODO AppendEntries here
+
+		// Change the config
+		newServers := make(map[int]string)
+		newServersToIdMap := make(map[string]int)
+
+		serversList := req.Servers
+
+		for _, val := range serversList {
+			// If it exists retain its ID
+			if id, ok := s.ServersToIdMap[val]; ok {
+				newServers[id] = val
+				newServersToIdMap[val] = id
+			} else {
+				newServers[s.NextParticipantId] = val
+				newServersToIdMap[val] = s.NextParticipantId
+				s.NextParticipantId++
+			}
+		}
+
+		// Wait until the config change is complete before responding
+		//<-s.configChangeComplete
+
+		s.Participants = newServers
+		s.ServersToIdMap = newServersToIdMap
+
+		newConfig := make(map[uint32]string)
+		for servId, servIp := range s.Participants {
+			newConfig[uint32(servId)] = servIp
+		}
+
+		return &raft.ConfigResponse{
+			Response: &raft.RPCResponse{
+				Success:  true,
+				Message:  "Config change request accepted successfully",
+				LeaderId: uint32(s.ServerID),
+			},
+			Servers: newConfig,
+		}, nil
+	}
+
+	return &raft.ConfigResponse{}, nil
 }
 
 func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raft.RequestVoteResponse, error) {
