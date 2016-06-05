@@ -489,6 +489,7 @@ out:
 				if err != nil {
 					log.Println("unable to get logindex")
 				}
+				atomic.StoreUint32(&r.CommitIndex, logLength)
 				r.MatchIndex = make(map[int]uint32)
 				for nodeId, _ := range r.nodes {
 					r.NextIndex[int(nodeId)] = logLength + 1
@@ -701,6 +702,7 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 			continue
 		}
 		if connState != grpc.Ready {
+			r.NextIndex[int(nodeId)] = logLength
 			continue
 		}
 
@@ -717,7 +719,8 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 
 	majority := (len(r.Participants) / 2) + 1
 	if numSuccess >= majority {
-		log.Println("majority obtained")
+		atomic.AddUint32(&r.CommitIndex, 1)
+		log.Println("majority obtained, commit index: ", r.CommitIndex)
 		return true, nil
 	} else {
 		log.Println("unable to obtain majority")
