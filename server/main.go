@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/boltdb/bolt"
@@ -77,6 +78,8 @@ type Raft struct {
 }
 
 type rpcConn struct {
+	isSyncing uint32 // only to be used atomically
+
 	conn   *grpc.ClientConn
 	client raft.RaftClient
 }
@@ -315,11 +318,6 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 		s.msgReceived <- struct{}{}
 	}
 
-	if len(req.Entries) == 0 {
-		s.metaStore.UpdateCurrentTerm(req.Term)
-		return &raft.AppendEntriesResponse{}, nil
-	}
-
 	currentTerm, err := s.metaStore.FetchCurrentTerm()
 	if err != nil {
 		return &raft.AppendEntriesResponse{currentTerm, false}, err
@@ -370,9 +368,12 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 			return &raft.AppendEntriesResponse{currentTerm, false}, err
 		}
 	}
-	log.Println("add new entry at index: ", req.LeaderCommit)
-	if err := s.logStore.AddEntry(req.LeaderCommit, req.Entries[0]); err != nil {
-		return &raft.AppendEntriesResponse{currentTerm, false}, err
+
+	if len(req.Entries) != 0 {
+		log.Println("add new entry at index: ", req.LeaderCommit)
+		if err := s.logStore.AddEntry(req.LeaderCommit, req.Entries[0]); err != nil {
+			return &raft.AppendEntriesResponse{currentTerm, false}, err
+		}
 	}
 
 	return &raft.AppendEntriesResponse{currentTerm, success}, nil
@@ -533,8 +534,25 @@ func (s *Raft) sendHeatBeat() {
 		lastTerm = lastEntry.Term
 	}
 
-	for _, node := range s.nodes {
-		go func(n raft.RaftClient) {
+	for nodeId, node := range s.nodes {
+		go func(nodeId uint32, node *rpcConn) {
+			// If the connection isn't in the ready state, then it isn't
+			// eligible for voting.
+			connState, err := node.conn.State()
+			if err != nil {
+				return
+			}
+			if connState != grpc.Ready {
+				return
+
+			}
+
+			if atomic.LoadUint32(&node.isSyncing) == 1 {
+				log.Printf("node %v is syncing, skipping heartbeat\n",
+					nodeId)
+				return
+			}
+
 			args := &raft.AppendEntriesArgs{
 				Term:         uint32(term),
 				LeaderId:     s.ServerID,
@@ -543,10 +561,24 @@ func (s *Raft) sendHeatBeat() {
 				LeaderCommit: logLength,
 			}
 
-			if _, err := n.AppendEntries(context.Background(), args); err != nil {
-				log.Fatalf("Server during heartbeat error:", err)
+			resp, err := node.client.AppendEntries(context.Background(), args)
+			if err != nil {
+				log.Println("Server during heartbeat error:", err)
+				return
 			}
-		}(node.client)
+
+			if !resp.Success {
+				log.Println("node %v is behind, syncing up\n", nodeId)
+
+				// Mark the node as currently syncing so future
+				// heartbeats don't duplicate the process.
+				atomic.StoreUint32(&node.isSyncing, 1)
+				if _, err := s.syncFollower(logLength, term, nodeId, node); err != nil {
+					log.Println("unable to sync follower: ", err)
+				}
+				atomic.StoreUint32(&node.isSyncing, 0)
+			}
+		}(nodeId, node)
 	}
 }
 
@@ -672,71 +704,14 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 			continue
 		}
 
-		// Attempt to replicate out this new entry to this follower. In
-		// the case the consistency check fails on the follower side,
-		// we decrement the index we're attempting to replicate and
-		// repeat the process.
-		caughtUp := false
-		for !caughtUp {
-			// Grab the nextIndex for this peer, which is the entry we'll
-			// replicate out.
-			nextIndex := r.NextIndex[int(nodeId)]
-			logEntry, err := r.logStore.FetchEntry(nextIndex)
-			if err != nil {
-				return false, err
-			}
+		success, err := r.syncFollower(logLength, currentTerm, nodeId, node)
+		if err != nil {
+			log.Println("unable to replicate log")
+			continue
+		}
 
-			prevLogEntry, err := r.logStore.FetchEntry(nextIndex - 1)
-			if err != nil {
-				return false, err
-			}
-
-			var lastTerm uint32
-			if prevLogEntry == nil {
-				lastTerm = 0
-			} else {
-				lastTerm = prevLogEntry.Term
-			}
-
-			log.Printf("replicating entry %d to node %d\n",
-				nextIndex, nodeId)
-
-			args := &raft.AppendEntriesArgs{
-				Term:         uint32(currentTerm),
-				LeaderId:     r.ServerID,
-				PrevLogIndex: nextIndex - 1,
-				PrevLogTerm:  lastTerm,
-				Entries: []*raft.LogEntry{
-					logEntry,
-				},
-				LeaderCommit: nextIndex,
-			}
-			resp, err := node.client.AppendEntries(context.Background(), args)
-			if err != nil {
-				return false, err
-			}
-
-			// If their reported term is higher then ours, then we
-			// aren't leader. So demote to follower, and cancel this
-			// replication attempt.
-			if resp.Term > currentTerm {
-				log.Println("node had higher term, falling back to follower")
-				r.stateTransition <- Follower
-				return false, nil
-			}
-			if !resp.Success {
-				log.Println("unable to replicate entry: ", nextIndex)
-				r.NextIndex[int(nodeId)] -= 1
-			} else {
-				log.Printf("replicated entry %d\n", nextIndex)
-
-				numSuccess += 1
-				r.NextIndex[int(nodeId)] += 1
-				if r.NextIndex[int(nodeId)] == logLength+1 {
-					log.Printf("node %d is fully caught up\n", nodeId)
-					caughtUp = true
-				}
-			}
+		if success {
+			numSuccess += 1
 		}
 	}
 
@@ -748,6 +723,76 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 		log.Println("unable to obtain majority")
 		return false, nil
 	}
+}
+
+func (r *Raft) syncFollower(logLength, currentTerm, nodeId uint32, node *rpcConn) (bool, error) {
+	// Attempt to replicate out this new entry to this follower. In
+	// the case the consistency check fails on the follower side,
+	// we decrement the index we're attempting to replicate and
+	// repeat the process.
+	caughtUp := false
+	for !caughtUp {
+		// Grab the nextIndex for this peer, which is the entry we'll
+		// replicate out.
+		nextIndex := r.NextIndex[int(nodeId)]
+		logEntry, err := r.logStore.FetchEntry(nextIndex)
+		if err != nil {
+			return false, err
+		}
+
+		prevLogEntry, err := r.logStore.FetchEntry(nextIndex - 1)
+		if err != nil {
+			return false, err
+		}
+
+		var lastTerm uint32
+		if prevLogEntry == nil {
+			lastTerm = 0
+		} else {
+			lastTerm = prevLogEntry.Term
+		}
+
+		log.Printf("replicating entry %d to node %d\n",
+			nextIndex, nodeId)
+
+		args := &raft.AppendEntriesArgs{
+			Term:         uint32(currentTerm),
+			LeaderId:     r.ServerID,
+			PrevLogIndex: nextIndex - 1,
+			PrevLogTerm:  lastTerm,
+			Entries: []*raft.LogEntry{
+				logEntry,
+			},
+			LeaderCommit: nextIndex,
+		}
+		resp, err := node.client.AppendEntries(context.Background(), args)
+		if err != nil {
+			return false, err
+		}
+
+		// If their reported term is higher then ours, then we
+		// aren't leader. So demote to follower, and cancel this
+		// replication attempt.
+		if resp.Term > currentTerm {
+			log.Println("node had higher term, falling back to follower")
+			r.stateTransition <- Follower
+			return false, nil
+		}
+		if !resp.Success {
+			log.Println("unable to replicate entry: ", nextIndex)
+			r.NextIndex[int(nodeId)] -= 1
+		} else {
+			log.Printf("replicated entry %d\n", nextIndex)
+
+			r.NextIndex[int(nodeId)] += 1
+			if r.NextIndex[int(nodeId)] == logLength+1 {
+				log.Printf("node %d is fully caught up\n", nodeId)
+				caughtUp = true
+			}
+		}
+	}
+
+	return true, nil
 }
 
 func main() {
