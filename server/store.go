@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 
 	"github.com/golang/protobuf/proto"
@@ -219,6 +220,7 @@ func (l *LogStore) FetchEntry(index uint32) (*raft.LogEntry, error) {
 		if bytes == nil {
 			return nil
 		}
+		entry = &raft.LogEntry{}
 
 		return proto.Unmarshal(bytes, entry)
 	})
@@ -261,7 +263,7 @@ func (l *LogStore) RemoveEntry(index uint32) error {
 	var bytesIndex [4]byte
 	endian.PutUint32(bytesIndex[:], index)
 
-	err := l.db.View(func(tx *bolt.Tx) error {
+	err := l.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(logBucket)
 		return b.Delete(bytesIndex[:])
 	})
@@ -275,11 +277,14 @@ func (l *LogStore) RemoveEntry(index uint32) error {
 func (l *LogStore) FetchAllEntries() ([]*raft.LogEntry, error) {
 	var entries []*raft.LogEntry
 
-	// TODO(roasbeef): will duplicate last entry
 	err := l.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(logBucket)
 
-		b.ForEach(func(k, v []byte) error {
+		ferr := b.ForEach(func(k, v []byte) error {
+			if bytes.Equal(lastIndex, k) {
+				return nil
+			}
+
 			entry := &raft.LogEntry{}
 			if err := proto.Unmarshal(v, entry); err != nil {
 				return err
@@ -289,13 +294,13 @@ func (l *LogStore) FetchAllEntries() ([]*raft.LogEntry, error) {
 			return nil
 		})
 
-		return nil
+		return ferr
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return nil, nil
+	return entries, nil
 }
 
 func (l *LogStore) LogLength() (uint32, error) {

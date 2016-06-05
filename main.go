@@ -120,7 +120,7 @@ func main() {
 			}
 			reply, err := client.Post(context.Background(), args)
 			if err != nil {
-				log.Fatal("Server error:", err)
+				log.Println("Server error:", err)
 			}
 			fmt.Printf("Server replied: \"%s\"\n", reply.Resp)
 

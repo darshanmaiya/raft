@@ -302,6 +302,9 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 		log.Printf("I lost the election because I received an empty "+
 			"AppendEntries from Server %d\n", req.LeaderId)
 		s.LeaderId = int(req.LeaderId)
+		if err := s.metaStore.UpdateCurrentTerm(req.Term); err != nil {
+			return &raft.AppendEntriesResponse{req.Term, false}, nil
+		}
 		s.electionLost <- struct{}{}
 	}
 
@@ -310,6 +313,11 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 	if state != Leader {
 		s.LeaderId = int(req.LeaderId)
 		s.msgReceived <- struct{}{}
+	}
+
+	if len(req.Entries) == 0 {
+		s.metaStore.UpdateCurrentTerm(req.Term)
+		return &raft.AppendEntriesResponse{}, nil
 	}
 
 	currentTerm, err := s.metaStore.FetchCurrentTerm()
@@ -322,10 +330,11 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 	success := true
 	if req.Term < currentTerm {
 		success = false
+		log.Printf("our term %v is higher than leaders %v", currentTerm, req.Term)
 		return &raft.AppendEntriesResponse{currentTerm, success}, nil
 	}
 	if req.Term != currentTerm {
-		log.Printf("current term %s is behind leader's term %s, updating\n",
+		log.Printf("current term %d is behind leader's term %d, updating\n",
 			currentTerm, req.Term)
 		if err := s.metaStore.UpdateCurrentTerm(req.Term); err != nil {
 			return &raft.AppendEntriesResponse{currentTerm, success}, nil
@@ -339,10 +348,15 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 
 	// If this previous log entry doesn't match the leader's advertised
 	// term, then there's an inconsistency, so return false.
-	if prevLogEntry.Term != req.PrevLogTerm {
+	if req.PrevLogTerm != 0 && (prevLogEntry == nil || prevLogEntry.Term != req.PrevLogTerm) {
 		success = false
-		log.Printf("prev entry has term %s, leader advertised %d \n",
-			prevLogEntry.Term, req.PrevLogTerm)
+		if prevLogEntry != nil {
+			log.Printf("prev entry has term %v, leader advertised %d \n",
+				prevLogEntry.Term, req.PrevLogTerm)
+		} else {
+			log.Printf("Entry not found!")
+		}
+
 		return &raft.AppendEntriesResponse{currentTerm, success}, nil
 	}
 
@@ -350,7 +364,7 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 	// delete it and append this one instead.
 	if logEntry, err := s.logStore.FetchEntry(req.LeaderCommit); err != nil {
 		return &raft.AppendEntriesResponse{currentTerm, false}, err
-	} else if logEntry != nil {
+	} else if logEntry != nil && logEntry.Term != currentTerm {
 		log.Printf("already have entry at index %d, deleting\n", req.LeaderCommit)
 		if err := s.logStore.RemoveEntry(req.LeaderCommit); err != nil {
 			return &raft.AppendEntriesResponse{currentTerm, false}, err
@@ -369,7 +383,7 @@ func (s *Raft) printParticipants() {
 
 	for i, value := range s.Participants {
 		if i == int(s.ServerID) {
-			fmt.Printf(">> Server %d @ %s <<\n", i, value)
+			fmt.Printf(">> Server %d @ %v <<\n", i, value)
 		} else {
 			fmt.Printf("Server %d @ %s\n", i, value)
 		}
@@ -442,9 +456,6 @@ out:
 				electionCancel <- struct{}{}
 			}
 			log.Println("I lost the election, switching to follower")
-			if electionCancel != nil {
-				electionCancel <- struct{}{}
-			}
 
 			if err := r.metaStore.UpdateState(Follower); err != nil {
 				log.Println("unable to update state")
@@ -487,9 +498,11 @@ out:
 				if err := r.metaStore.UpdateVotedFor(-1); err != nil {
 					log.Println("unable to update voted for")
 				}
+				heartBeatTimer = nil
 				serverDownTimer = time.After(serverDownTimeout)
 			}
 			close(r.stateUpdate)
+			r.stateUpdate = make(chan struct{})
 		case <-r.quit:
 			break out
 		}
@@ -627,17 +640,6 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	lastEntry, err := r.logStore.FetchEntry(logLength - 1)
-	if err != nil {
-		log.Println("unable to fetch entry")
-	}
-
-	var lastTerm uint32
-	if lastEntry == nil {
-		lastTerm = 0
-	} else {
-		lastTerm = lastEntry.Term
-	}
 
 	currentTerm, err := r.metaStore.FetchCurrentTerm()
 	if err != nil {
@@ -650,14 +652,15 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 		Msg:  newPost.Msg,
 	}
 	logLength += 1
-	log.Printf("writing new entry at index %s \n", logLength)
+	log.Printf("writing new entry at index %d \n", logLength)
+	log.Println("current term: ", currentTerm)
 	if err := r.logStore.AddEntry(logLength, entry); err != nil {
 		return false, err
 	}
 
 	// Once we've written out to our local log, replicate the entry to all
 	// followers, doing any re-orgs required to bring them up to date.
-	numSuccess := 0
+	numSuccess := 1
 	for nodeId, node := range r.nodes {
 		// If the connection isn't in the ready state, then it isn't
 		// eligible for voting.
@@ -667,7 +670,6 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 		}
 		if connState != grpc.Ready {
 			continue
-
 		}
 
 		// Attempt to replicate out this new entry to this follower. In
@@ -684,18 +686,30 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 				return false, err
 			}
 
-			log.Printf("replicating entry %s to node %s\n",
+			prevLogEntry, err := r.logStore.FetchEntry(nextIndex - 1)
+			if err != nil {
+				return false, err
+			}
+
+			var lastTerm uint32
+			if prevLogEntry == nil {
+				lastTerm = 0
+			} else {
+				lastTerm = prevLogEntry.Term
+			}
+
+			log.Printf("replicating entry %d to node %d\n",
 				nextIndex, nodeId)
 
 			args := &raft.AppendEntriesArgs{
 				Term:         uint32(currentTerm),
 				LeaderId:     r.ServerID,
-				PrevLogIndex: logLength - 1,
+				PrevLogIndex: nextIndex - 1,
 				PrevLogTerm:  lastTerm,
 				Entries: []*raft.LogEntry{
 					logEntry,
 				},
-				LeaderCommit: logLength,
+				LeaderCommit: nextIndex,
 			}
 			resp, err := node.client.AppendEntries(context.Background(), args)
 			if err != nil {
@@ -714,12 +728,12 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 				log.Println("unable to replicate entry: ", nextIndex)
 				r.NextIndex[int(nodeId)] -= 1
 			} else {
-				log.Printf("replicated entry %s\n", nextIndex)
+				log.Printf("replicated entry %d\n", nextIndex)
 
 				numSuccess += 1
 				r.NextIndex[int(nodeId)] += 1
 				if r.NextIndex[int(nodeId)] == logLength+1 {
-					log.Printf("node %s is fully caught up\n", nodeId)
+					log.Printf("node %d is fully caught up\n", nodeId)
 					caughtUp = true
 				}
 			}
@@ -727,7 +741,7 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 	}
 
 	majority := (len(r.Participants) / 2) + 1
-	if numSuccess > majority {
+	if numSuccess >= majority {
 		log.Println("majority obtained")
 		return true, nil
 	} else {
