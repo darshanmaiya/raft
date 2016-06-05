@@ -61,6 +61,8 @@ type Raft struct {
 
 	// Participants is the set of all participating servers in Raft.
 	Participants map[int]string
+	// Reverse mapping of server IPs to IDs
+	ServersToIdMap map[string]int
 
 	// Leader ID from whom the last message was received
 	LeaderId int
@@ -179,9 +181,11 @@ func (s *Raft) Post(ctx context.Context, req *raft.PostArgs) (*raft.PostResponse
 	if state == Follower {
 		log.Println("redirectiong client to leader: ", s.LeaderId)
 		return &raft.PostResponse{
-			Success:  false,
-			Resp:     "I'm not the leader",
-			LeaderId: uint32(s.LeaderId),
+			Response: &raft.RPCResponse{
+				Success:  false,
+				Message:  "I'm not the leader",
+				LeaderId: uint32(s.LeaderId),
+			},
 		}, nil
 	} else if state == Leader {
 		// Replicate the new entry to all peers synchronously before we
@@ -197,9 +201,11 @@ func (s *Raft) Post(ctx context.Context, req *raft.PostArgs) (*raft.PostResponse
 
 		// AppendEntries here
 		return &raft.PostResponse{
-			Success:  true,
-			Resp:     "Message posted",
-			LeaderId: uint32(s.ServerID),
+			Response: &raft.RPCResponse{
+				Success:  true,
+				Message:  "Message posted",
+				LeaderId: uint32(s.ServerID),
+			},
 		}, nil
 	}
 
@@ -213,30 +219,53 @@ func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupRe
 		return nil, err
 	}
 
-	return &raft.LookupResponse{
-		Entries: entries,
-	}, nil
+	state, err := s.metaStore.FetchState()
+	if err != nil {
+		return &raft.LookupResponse{}, err
+	}
+
+	if state == Candidate {
+		// State is candidate, wait for a signal before responding
+		<-s.stateUpdate
+	}
+
+	if state == Follower {
+		log.Println("redirectiong client to leader: ", s.LeaderId)
+		return &raft.LookupResponse{
+			Response: &raft.RPCResponse{
+				Success:  false,
+				Message:  "I'm not the leader",
+				LeaderId: uint32(s.LeaderId),
+			},
+		}, nil
+	} else if state == Leader {
+		return &raft.LookupResponse{
+			Response: &raft.RPCResponse{
+				Success:  true,
+				Message:  "Lookup successful",
+				LeaderId: uint32(s.LeaderId),
+			},
+			Entries: entries,
+		}, nil
+	}
+
+	return &raft.LookupResponse{}, nil
 }
 
 func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigResponse, error) {
 
-	// TODO AppendEntries here
-
 	// Change the config
-	if req.NewConfig.Command == "add" {
-		for servId, servIp := range req.NewConfig.Servers {
-			s.Participants[int(servId)] = servIp
+	/*newServers := make(map[int]string)
+
+	serversList := req.Servers
+
+	for i, val := range serversList {
+		if id, ok := s.ServersToIdMap[val]; !ok {
+
 		}
-	} else if req.NewConfig.Command == "remove" {
-		for servId, _ := range req.NewConfig.Servers {
-			delete(s.Participants, int(servId))
-		}
-	} else {
-		s.Participants = make(map[int]string)
-		for servId, servIp := range req.NewConfig.Servers {
-			s.Participants[int(servId)] = servIp
-		}
-	}
+	}*/
+
+	// TODO AppendEntries here
 
 	newConfig := make(map[uint32]string)
 	for servId, servIp := range s.Participants {
@@ -244,8 +273,11 @@ func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigRe
 	}
 
 	return &raft.ConfigResponse{
-		Success: true,
-		Message: "Config changed sucessfully",
+		Response: &raft.RPCResponse{
+			Success:  true,
+			Message:  "Config change request accepted sucessfully",
+			LeaderId: uint32(s.ServerID),
+		},
 		Servers: newConfig,
 	}, nil
 }

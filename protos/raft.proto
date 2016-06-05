@@ -14,24 +14,22 @@ message PostArgs {
     string msg = 1;
 }
 message PostResponse {
-	bool success = 1;
-    string resp = 2;
-	uint32 leaderId = 3;
+	RPCResponse response = 1;
 }
 
 message LookupArgs {
 }
 message LookupResponse {
-    repeated LogEntry entries = 1;
+	RPCResponse response = 1;
+    repeated LogEntry entries = 2;
 }
 
 message ConfigArgs {
-	ConfigChange newConfig = 1;
+	repeated string servers = 1;
 }
 message ConfigResponse {
-    bool success = 1;
-	string message = 2;
-	map<uint32, string> servers = 3;
+	RPCResponse response = 1;
+	map<uint32, string> servers = 2;
 }
 
 message RequestVoteArgs {
@@ -90,6 +88,11 @@ message LogEntry {
 }
 
 message ConfigChange {
-	string command = 1;
-	map<uint32, string> servers = 2;
+	map<uint32, string> newServers = 1;
+}
+
+message RPCResponse {
+	bool success = 1;
+    string message = 2;
+	uint32 leaderId = 3;
 }
