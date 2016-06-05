@@ -268,22 +268,44 @@ func (s *Raft) RequestVote(ctx context.Context, req *raft.RequestVoteArgs) (*raf
 	if err != nil {
 		return nil, err
 	}
+	logLength, err := s.logStore.LogLength()
+	if err != nil {
+		return nil, err
+	}
 
 	if req.Term < uint32(currentTerm) || votedFor != -1 || state != Follower {
+		log.Println("candidate's term is outdated, ignoring vote")
 		granted = false
 	} else {
-		if err := s.metaStore.UpdateCurrentTerm(req.Term); err != nil {
-			return nil, err
-		}
-		currentTerm = req.Term
-
-		if err := s.metaStore.UpdateVotedFor(int32(req.CandidateId)); err != nil {
+		entry, err := s.logStore.FetchEntry(req.LastLogIndex)
+		if err != nil {
 			return nil, err
 		}
 
-		granted = true
+		// TODO(roasbeef): safety not enfored?
+		if req.LastLogIndex < logLength {
+			log.Printf("candidate's log is out of date, denying: %v vs %v\n",
+				req.LastLogIndex, logLength)
+			granted = false
+		} else if entry != nil && entry.Term != req.LastLogTerm {
+			log.Printf("candidate's log term is out of date, denying: %v vs %v\n",
+				req.LastLogTerm, entry.Term)
+			granted = false
+		} else {
 
-		s.msgReceived <- struct{}{}
+			if err := s.metaStore.UpdateCurrentTerm(req.Term); err != nil {
+				return nil, err
+			}
+			currentTerm = req.Term
+
+			if err := s.metaStore.UpdateVotedFor(int32(req.CandidateId)); err != nil {
+				return nil, err
+			}
+
+			granted = true
+
+			s.msgReceived <- struct{}{}
+		}
 	}
 
 	fmt.Printf("Server %d is requesting vote..\n", req.CandidateId)
@@ -326,11 +348,6 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 	// With the initial checks complete, attempt to add this new entry to
 	// our log, responding appropritely.
 	success := true
-	if req.Term < currentTerm {
-		success = false
-		log.Printf("our term %v is higher than leaders %v", currentTerm, req.Term)
-		return &raft.AppendEntriesResponse{currentTerm, success}, nil
-	}
 	if req.Term != currentTerm {
 		log.Printf("current term %d is behind leader's term %d, updating\n",
 			currentTerm, req.Term)
@@ -452,6 +469,7 @@ out:
 			// We got a message from the leader before the timeout was
 			// up. So reset it.
 			serverDownTimer = time.After(serverDownTimeout)
+			electionTimer = nil
 		case <-r.electionLost:
 			if electionCancel != nil {
 				electionCancel <- struct{}{}
@@ -568,8 +586,8 @@ func (s *Raft) sendHeatBeat() {
 				return
 			}
 
-			if !resp.Success {
-				log.Println("node %v is behind, syncing up\n", nodeId)
+			if !resp.Success && resp.Term == term {
+				log.Printf("node %v is behind, syncing up\n", nodeId)
 
 				// Mark the node as currently syncing so future
 				// heartbeats don't duplicate the process.
