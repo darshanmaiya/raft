@@ -88,7 +88,9 @@ message LogEntry {
 }
 
 message ConfigChange {
-	map<uint32, string> newServers = 1;
+	bool complete = 1;
+	map<uint32, string> oldServers = 2;
+	map<uint32, string> newServers = 3;
 }
 
 message RPCResponse {

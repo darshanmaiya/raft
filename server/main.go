@@ -69,9 +69,8 @@ type Raft struct {
 	// Leader ID from whom the last message was received
 	LeaderId int
 
-	stateTransition      chan NodeState
-	stateUpdate          chan struct{}
-	configChangeComplete chan struct{}
+	stateTransition chan NodeState
+	stateUpdate     chan struct{}
 
 	electionLost chan struct{}
 	msgReceived  chan struct{}
@@ -118,9 +117,8 @@ func newRaft(serverID uint32) (*Raft, error) {
 
 		LeaderId: -1,
 
-		stateTransition:      make(chan NodeState, 1),
-		stateUpdate:          make(chan struct{}),
-		configChangeComplete: make(chan struct{}),
+		stateTransition: make(chan NodeState, 1),
+		stateUpdate:     make(chan struct{}),
 
 		electionLost: make(chan struct{}, 1),
 		msgReceived:  make(chan struct{}, 1),
@@ -141,7 +139,11 @@ func newRaft(serverID uint32) (*Raft, error) {
 	}
 
 	// Set the port for this server
-	s.Port = strings.Split(s.Participants[int(serverID)], ":")[1]
+	if _, ok := s.Participants[int(serverID)]; !ok {
+		s.Port = strconv.Itoa(50000 + int(serverID))
+	} else {
+		s.Port = strings.Split(s.Participants[int(serverID)], ":")[1]
+	}
 
 	for i, server := range s.Participants {
 		if i == int(s.ServerID) {
@@ -199,7 +201,7 @@ func (s *Raft) Post(ctx context.Context, req *raft.PostArgs) (*raft.PostResponse
 	} else if state == Leader {
 		// Replicate the new entry to all peers synchronously before we
 		// reply to the client.
-		ok, err := s.replicateEntry(req)
+		ok, err := s.replicateEntry(req, nil)
 		if err != nil {
 			log.Println("error replicating entry to follower")
 			return &raft.PostResponse{}, err
@@ -284,11 +286,12 @@ func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigRe
 		}, nil
 	} else if state == Leader {
 
-		// TODO AppendEntries here
-
 		// Change the config
 		newServers := make(map[int]string)
 		newServersToIdMap := make(map[string]int)
+		newConfigChange := make(map[uint32]string)
+
+		newParticipants := make(map[int]string)
 
 		serversList := req.Servers
 
@@ -296,16 +299,88 @@ func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigRe
 			// If it exists retain its ID
 			if id, ok := s.ServersToIdMap[val]; ok {
 				newServers[id] = val
+				newConfigChange[uint32(id)] = val
 				newServersToIdMap[val] = id
 			} else {
 				newServers[s.NextParticipantId] = val
+				newConfigChange[uint32(s.NextParticipantId)] = val
 				newServersToIdMap[val] = s.NextParticipantId
+
+				newParticipants[s.NextParticipantId] = val
+
 				s.NextParticipantId++
 			}
 		}
 
-		// Wait until the config change is complete before responding
-		//<-s.configChangeComplete
+		oldServersConfig := make(map[uint32]string)
+		for id, val := range s.Participants {
+			oldServersConfig[uint32(id)] = val
+		}
+
+		// Replicate the new entry to all peers synchronously before we
+		// reply to the client.
+		// Replicate old + new
+		ok, err := s.replicateEntry(nil, &raft.ConfigChange{
+			Complete:   false,
+			NewServers: newConfigChange,
+			OldServers: oldServersConfig,
+		})
+
+		if err != nil {
+			log.Println("error replicating entry to follower")
+			return &raft.ConfigResponse{}, err
+		} else if !ok {
+			log.Println("unable to obtain majority to replicate entries")
+			return &raft.ConfigResponse{}, fmt.Errorf("unable to get majority")
+		}
+
+		// get current log length
+		logLength, err := s.logStore.LogLength()
+		if err != nil {
+			log.Println("error getting log length")
+			return &raft.ConfigResponse{}, err
+		}
+
+		// establish new connections
+		for i, server := range newParticipants {
+			var opts []grpc.DialOption
+			opts = append(opts, grpc.WithInsecure())
+			opts = append(opts, grpc.WithBackoffConfig(grpc.BackoffConfig{MaxDelay: 100 * time.Millisecond}))
+			opts = append(opts, grpc.WithTimeout(time.Minute*5))
+			conn, err := grpc.Dial(server, opts...)
+			if err != nil {
+				return nil, err
+			}
+
+			client := raft.NewRaftClient(conn)
+			s.nodes[uint32(i)] = &rpcConn{
+				conn:   conn,
+				client: client,
+			}
+			s.NextIndex[i] = logLength
+		}
+
+		// Replicate new
+		ok, err = s.replicateEntry(nil, &raft.ConfigChange{
+			Complete:   true,
+			NewServers: newConfigChange,
+		})
+
+		if err != nil {
+			log.Println("error replicating entry to follower")
+			return &raft.ConfigResponse{}, err
+		} else if !ok {
+			log.Println("unable to obtain majority to replicate entries")
+			return &raft.ConfigResponse{}, fmt.Errorf("unable to get majority")
+		}
+
+		// Remove old participants
+		for id, _ := range s.Participants {
+			if _, ok := newServers[id]; !ok {
+				s.nodes[uint32(id)].conn.Close()
+				delete(s.nodes, uint32(id))
+			}
+		}
 
 		s.Participants = newServers
 		s.ServersToIdMap = newServersToIdMap
@@ -457,7 +532,7 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 	// delete it and append this one instead.
 	if logEntry, err := s.logStore.FetchEntry(req.LeaderCommit); err != nil {
 		return &raft.AppendEntriesResponse{currentTerm, false}, err
-	} else if logEntry != nil && logEntry.Term != currentTerm {
+	} else if logEntry != nil && logEntry.Term != currentTerm && len(req.Entries) > 0 {
 		log.Printf("already have entry at index %d, deleting\n", req.LeaderCommit)
 		if err := s.logStore.RemoveEntry(req.LeaderCommit); err != nil {
 			return &raft.AppendEntriesResponse{currentTerm, false}, err
@@ -468,6 +543,57 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 		log.Println("add new entry at index: ", req.LeaderCommit)
 		if err := s.logStore.AddEntry(req.LeaderCommit, req.Entries[0]); err != nil {
 			return &raft.AppendEntriesResponse{currentTerm, false}, err
+		}
+	}
+
+	// A config change request
+	if len(req.Entries) > 0 && req.Entries[0].ConfigChange != nil {
+		newConfig := req.Entries[0].ConfigChange.NewServers
+
+		if !req.Entries[0].ConfigChange.Complete {
+
+			// Establish new connections
+			for id, newServerIp := range newConfig {
+				// if id does not exists in s.nodes
+				// add to s.nodes
+				if _, ok := s.nodes[uint32(id)]; !ok {
+					var opts []grpc.DialOption
+					opts = append(opts, grpc.WithInsecure())
+					opts = append(opts, grpc.WithBackoffConfig(grpc.BackoffConfig{MaxDelay: 100 * time.Millisecond}))
+					opts = append(opts, grpc.WithTimeout(time.Minute*5))
+					conn, err := grpc.Dial(newServerIp, opts...)
+					if err != nil {
+						return nil, err
+					}
+
+					client := raft.NewRaftClient(conn)
+					s.nodes[uint32(id)] = &rpcConn{
+						conn:   conn,
+						client: client,
+					}
+				}
+			}
+		} else {
+			// Remove old connections
+			for id, _ := range s.Participants {
+				if _, ok := newConfig[uint32(id)]; !ok {
+					s.nodes[uint32(id)].conn.Close()
+					delete(s.nodes, uint32(id))
+				}
+			}
+
+			// Reinitialize new participants
+			s.Participants = make(map[int]string)
+			s.ServersToIdMap = make(map[string]int)
+			var maxId int
+			for id, val := range newConfig {
+				if int(id) > maxId {
+					maxId = int(id)
+				}
+				s.Participants[int(id)] = val
+				s.ServersToIdMap[val] = int(id)
+			}
+			s.NextParticipantId = maxId
 		}
 	}
 
@@ -640,8 +766,8 @@ func (s *Raft) sendHeatBeat() {
 				return
 			}
 			if connState != grpc.Ready {
+				s.NextIndex[int(nodeId)] = logLength
 				return
-
 			}
 
 			if atomic.LoadUint32(&node.isSyncing) == 1 {
@@ -731,7 +857,7 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 			reply, err := n.RequestVote(context.Background(), args)
 			fmt.Println("Received request vote...")
 			if err != nil {
-				log.Fatal("Server error:", err)
+				log.Print("Server error:", err)
 				response <- raft.RequestVoteResponse{
 					VoteGranted: false,
 				}
@@ -764,7 +890,7 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 	}
 }
 
-func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
+func (r *Raft) replicateEntry(newPost *raft.PostArgs, newConfig *raft.ConfigChange) (bool, error) {
 	logLength, err := r.logStore.LogLength()
 	if err != nil {
 		return false, err
@@ -776,10 +902,19 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 	}
 
 	// First write the new entry into our log.
-	entry := &raft.LogEntry{
-		Term: currentTerm,
-		Msg:  newPost.Msg,
+	entry := &raft.LogEntry{}
+	if newPost != nil {
+		entry = &raft.LogEntry{
+			Term: currentTerm,
+			Msg:  newPost.Msg,
+		}
+	} else {
+		entry = &raft.LogEntry{
+			Term:         currentTerm,
+			ConfigChange: newConfig,
+		}
 	}
+
 	logLength += 1
 	log.Printf("writing new entry at index %d \n", logLength)
 	log.Println("current term: ", currentTerm)
@@ -802,11 +937,14 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs) (bool, error) {
 			continue
 		}
 
+		atomic.StoreUint32(&node.isSyncing, 1)
 		success, err := r.syncFollower(logLength, currentTerm, nodeId, node)
 		if err != nil {
 			log.Println("unable to replicate log")
+			atomic.StoreUint32(&node.isSyncing, 0)
 			continue
 		}
+		atomic.StoreUint32(&node.isSyncing, 0)
 
 		if success {
 			numSuccess += 1
@@ -834,6 +972,10 @@ func (r *Raft) syncFollower(logLength, currentTerm, nodeId uint32, node *rpcConn
 		// Grab the nextIndex for this peer, which is the entry we'll
 		// replicate out.
 		nextIndex := r.NextIndex[int(nodeId)]
+		if nextIndex == 0 {
+			nextIndex = 1
+			r.NextIndex[int(nodeId)] = 1
+		}
 		logEntry, err := r.logStore.FetchEntry(nextIndex)
 		if err != nil {
 			return false, err
