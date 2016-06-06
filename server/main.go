@@ -77,6 +77,9 @@ type Raft struct {
 
 	nodes map[uint32]*rpcConn
 
+	configInFlight bool
+	pendingConfig  map[uint32]string
+
 	wg   sync.WaitGroup
 	quit chan struct{}
 }
@@ -123,7 +126,8 @@ func newRaft(serverID uint32) (*Raft, error) {
 		electionLost: make(chan struct{}, 1),
 		msgReceived:  make(chan struct{}, 1),
 
-		nodes: make(map[uint32]*rpcConn),
+		nodes:         make(map[uint32]*rpcConn),
+		pendingConfig: make(map[uint32]string),
 
 		quit: make(chan struct{}, 1),
 	}
@@ -551,6 +555,8 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 		newConfig := req.Entries[0].ConfigChange.NewServers
 
 		if !req.Entries[0].ConfigChange.Complete {
+			s.configInFlight = false
+			s.pendingConfig = nil
 
 			// Establish new connections
 			for id, newServerIp := range newConfig {
@@ -574,6 +580,9 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 				}
 			}
 		} else {
+			s.configInFlight = true
+			s.pendingConfig = newConfig
+
 			// Remove old connections
 			for id, _ := range s.Participants {
 				if _, ok := newConfig[uint32(id)]; !ok {
@@ -925,6 +934,8 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs, newConfig *raft.ConfigChan
 	// Once we've written out to our local log, replicate the entry to all
 	// followers, doing any re-orgs required to bring them up to date.
 	numSuccess := 1
+	numNew := 0
+	numOld := 0
 	for nodeId, node := range r.nodes {
 		// If the connection isn't in the ready state, then it isn't
 		// eligible for voting.
@@ -949,16 +960,39 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs, newConfig *raft.ConfigChan
 		if success {
 			numSuccess += 1
 		}
+
+		if r.configInFlight {
+			if _, ok := r.pendingConfig[nodeId]; ok {
+				numNew += 1
+			} else {
+				numOld += 1
+			}
+		}
 	}
 
-	majority := (len(r.Participants) / 2) + 1
-	if numSuccess >= majority {
-		atomic.AddUint32(&r.CommitIndex, 1)
-		log.Println("majority obtained, commit index: ", r.CommitIndex)
-		return true, nil
+	// If we're in the middle of a configuration change, then we need to
+	// ensure we have a majority from both the new and old config.
+	if !r.configInFlight {
+		majority := (len(r.Participants) / 2) + 1
+		if numSuccess >= majority {
+			atomic.AddUint32(&r.CommitIndex, 1)
+			log.Println("majority obtained, commit index: ", r.CommitIndex)
+			return true, nil
+		} else {
+			log.Println("unable to obtain majority")
+			return false, nil
+		}
 	} else {
-		log.Println("unable to obtain majority")
-		return false, nil
+		newMajority := (len(r.pendingConfig) / 2) + 1
+		oldMajority := (len(r.Participants) / 2) + 1
+		if numNew >= newMajority && numOld >= oldMajority {
+			atomic.AddUint32(&r.CommitIndex, 1)
+			log.Println("majority obtained, commit index: ", r.CommitIndex)
+			return true, nil
+		} else {
+			log.Println("unable to obtain majority")
+			return false, nil
+		}
 	}
 }
 
