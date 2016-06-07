@@ -594,8 +594,10 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 			// Remove old connections
 			for id, _ := range s.Participants {
 				if _, ok := newConfig[uint32(id)]; !ok {
-					s.nodes[uint32(id)].conn.Close()
-					delete(s.nodes, uint32(id))
+					if id != int(s.ServerID) {
+						s.nodes[uint32(id)].conn.Close()
+						delete(s.nodes, uint32(id))
+					}
 				}
 			}
 
@@ -847,7 +849,7 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 	if err != nil {
 		log.Println("unable to get log length")
 	}
-	lastEntry, err := s.logStore.FetchEntry(logLength - 1)
+	lastEntry, err := s.logStore.FetchEntry(logLength)
 	if err != nil {
 		log.Println("unable to fetch entry")
 	}
@@ -876,8 +878,8 @@ func (s *Raft) startElection(cancelSignal chan struct{},
 				Term:         term,
 				CandidateId:  s.ServerID,
 				LastLogIndex: logLength,
+				LastLogTerm:  lastTerm,
 			}
-			args.LastLogTerm = lastTerm
 			fmt.Println("Sending request vote...")
 			reply, err := n.RequestVote(context.Background(), args)
 			fmt.Println("Received request vote...")
