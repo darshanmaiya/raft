@@ -260,7 +260,7 @@ func (s *Raft) Lookup(ctx context.Context, req *raft.LookupArgs) (*raft.LookupRe
 				Message:  "Lookup successful",
 				LeaderId: uint32(s.LeaderId),
 			},
-			Entries: entries,
+			Entries: entries[0:s.CommitIndex],
 		}, nil
 	}
 
@@ -381,8 +381,10 @@ func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigRe
 		// Remove old participants
 		for id, _ := range s.Participants {
 			if _, ok := newServers[id]; !ok {
-				s.nodes[uint32(id)].conn.Close()
-				delete(s.nodes, uint32(id))
+				if id != int(s.ServerID) {
+					s.nodes[uint32(id)].conn.Close()
+					delete(s.nodes, uint32(id))
+				}
 			}
 		}
 
@@ -393,6 +395,12 @@ func (s *Raft) Config(ctx context.Context, req *raft.ConfigArgs) (*raft.ConfigRe
 		for servId, servIp := range s.Participants {
 			newConfig[uint32(servId)] = servIp
 		}
+
+		// If I'm not in the new config then shutdown
+		/*if _, ok := s.Participants[int(s.ServerID)]; !ok {
+			log.Println("I'm not in the new configuration, so shutting down...")
+			close(s.quit)
+		}*/
 
 		return &raft.ConfigResponse{
 			Response: &raft.RPCResponse{
@@ -555,14 +563,14 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 		newConfig := req.Entries[0].ConfigChange.NewServers
 
 		if !req.Entries[0].ConfigChange.Complete {
-			s.configInFlight = false
-			s.pendingConfig = nil
+			s.configInFlight = true
+			s.pendingConfig = newConfig
 
 			// Establish new connections
 			for id, newServerIp := range newConfig {
 				// if id does not exists in s.nodes
 				// add to s.nodes
-				if _, ok := s.nodes[uint32(id)]; !ok {
+				if _, ok := s.nodes[uint32(id)]; !ok && id != s.ServerID {
 					var opts []grpc.DialOption
 					opts = append(opts, grpc.WithInsecure())
 					opts = append(opts, grpc.WithBackoffConfig(grpc.BackoffConfig{MaxDelay: 100 * time.Millisecond}))
@@ -580,8 +588,8 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 				}
 			}
 		} else {
-			s.configInFlight = true
-			s.pendingConfig = newConfig
+			s.configInFlight = false
+			s.pendingConfig = nil
 
 			// Remove old connections
 			for id, _ := range s.Participants {
@@ -603,6 +611,12 @@ func (s *Raft) AppendEntries(ctx context.Context, req *raft.AppendEntriesArgs) (
 				s.ServersToIdMap[val] = int(id)
 			}
 			s.NextParticipantId = maxId
+
+			// If I'm not in the new config then shutdown
+			/*if _, ok := s.Participants[int(s.ServerID)]; !ok {
+				log.Println("I'm not in the new configuration, so stopping server...")
+				close(s.quit)
+			}*/
 		}
 	}
 
@@ -673,12 +687,12 @@ out:
 		case <-heartBeatTimer:
 			// Send out heart beats to all participants, and reset the
 			// timer.
-			log.Println("Sending heart beat")
+			//log.Println("Sending heart beat")
 			go r.sendHeatBeat()
 
 			heartBeatTimer = time.After(heartBeatTimeout)
 		case <-r.msgReceived:
-			log.Println("Received heartbeat, leader is still up")
+			//log.Println("Received heartbeat, leader is still up")
 			// We got a message from the leader before the timeout was
 			// up. So reset it.
 			serverDownTimer = time.After(serverDownTimeout)
@@ -804,8 +818,10 @@ func (s *Raft) sendHeatBeat() {
 
 				// Mark the node as currently syncing so future
 				// heartbeats don't duplicate the process.
-				atomic.StoreUint32(&node.isSyncing, 1)
-				if _, err := s.syncFollower(logLength, term, nodeId, node); err != nil {
+				if !atomic.CompareAndSwapUint32(&node.isSyncing, 0, 1) {
+					return
+				}
+				if _, err := s.syncFollower(term, nodeId, node); err != nil {
 					log.Println("unable to sync follower: ", err)
 				}
 				atomic.StoreUint32(&node.isSyncing, 0)
@@ -943,15 +959,16 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs, newConfig *raft.ConfigChan
 		if err != nil {
 			continue
 		}
+
 		if connState != grpc.Ready {
 			r.NextIndex[int(nodeId)] = logLength
 			continue
 		}
 
 		atomic.StoreUint32(&node.isSyncing, 1)
-		success, err := r.syncFollower(logLength, currentTerm, nodeId, node)
+		success, err := r.syncFollower(currentTerm, nodeId, node)
 		if err != nil {
-			log.Println("unable to replicate log")
+			log.Println("unable to replicate log: ", err)
 			atomic.StoreUint32(&node.isSyncing, 0)
 			continue
 		}
@@ -973,7 +990,7 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs, newConfig *raft.ConfigChan
 	// If we're in the middle of a configuration change, then we need to
 	// ensure we have a majority from both the new and old config.
 	if !r.configInFlight {
-		majority := (len(r.Participants) / 2) + 1
+		majority := (len(r.nodes) / 2) + 1
 		if numSuccess >= majority {
 			atomic.AddUint32(&r.CommitIndex, 1)
 			log.Println("majority obtained, commit index: ", r.CommitIndex)
@@ -990,25 +1007,29 @@ func (r *Raft) replicateEntry(newPost *raft.PostArgs, newConfig *raft.ConfigChan
 			log.Println("majority obtained, commit index: ", r.CommitIndex)
 			return true, nil
 		} else {
-			log.Println("unable to obtain majority")
+			log.Println("unable to obtain majority (joint)")
 			return false, nil
 		}
 	}
 }
 
-func (r *Raft) syncFollower(logLength, currentTerm, nodeId uint32, node *rpcConn) (bool, error) {
+func (r *Raft) syncFollower(currentTerm, nodeId uint32, node *rpcConn) (bool, error) {
 	// Attempt to replicate out this new entry to this follower. In
 	// the case the consistency check fails on the follower side,
 	// we decrement the index we're attempting to replicate and
 	// repeat the process.
 	caughtUp := false
 	for !caughtUp {
+		logLength, err := r.logStore.LogLength()
 		// Grab the nextIndex for this peer, which is the entry we'll
 		// replicate out.
 		nextIndex := r.NextIndex[int(nodeId)]
 		if nextIndex == 0 {
 			nextIndex = 1
 			r.NextIndex[int(nodeId)] = 1
+		}
+		if nextIndex >= logLength+1 {
+			return true, nil
 		}
 		logEntry, err := r.logStore.FetchEntry(nextIndex)
 		if err != nil {

@@ -220,7 +220,11 @@ func printLogMessages(messages []*raft.LogEntry) {
 		if value.ConfigChange == nil {
 			fmt.Printf("Log Index: %d, Term: %d, Message: \"%s\"\n", i, value.Term, value.Msg)
 		} else {
-			fmt.Printf("Log Index: %d, Term: %d, Message: Config changed\n", i, value.Term)
+			if !value.ConfigChange.Complete {
+				fmt.Printf("Log Index: %d, Term: %d, Message: Config change started\n", i, value.Term)
+			} else {
+				fmt.Printf("Log Index: %d, Term: %d, Message: Config change complete\n", i, value.Term)
+			}
 		}
 	}
 }
